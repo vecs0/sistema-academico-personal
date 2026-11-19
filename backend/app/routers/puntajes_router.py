@@ -1,0 +1,649 @@
+"""
+Motor de notas por puntos: carga de notas (parcial1/2/practico/final1-3), configuración de
+pesos por materia (PUT /puntajes/pesos/{materia_id}, debe sumar 100), estadísticas.
+Depende de: services/puntajes_utils.py — toda la lógica de cálculo vive ahí, este router
+solo valida permisos (profesor titular o admin) y delega.
+"""
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from typing import Optional
+from app import models, schemas, database
+from app.dependencias import get_current_user
+from app.email_utils import send_new_grade_email_bg
+from app.services.autorizacion import es_profesor_de_alumno, es_profesor_de_materia
+from app.services.puntajes_utils import APROBACION_MINIMA, calcular_promedio_final, get_pesos, promedios_por_alumno
+from app.services.expediente import asistencia_minima_institucional
+# AUDIT-FIX B-3: referencia corregida post-merge — _oferta_activa_id vive en asistencias_router
+from app.routers.asistencias_router import _oferta_activa_id, calcular_porcentaje_asistencia
+
+router = APIRouter(prefix="/puntajes", tags=["puntajes"])
+
+_TIPOS_NOTA_FINAL = {"final1", "final2", "final3", "directa"}
+
+
+def _verificar_regularidad(db: Session, user_id: int, materia_id: int, tipo: str) -> None:
+    """Gate de regularidad (Art. 24 Reglamento UCA): un profesor no puede cargar
+    la nota final de un alumno si su asistencia esta por debajo del minimo
+    institucional. Solo aplica a las notas que definen aprobado/reprobado
+    (final1/2/3, directa) -- los parciales y el practico se cargan libremente
+    durante el cursado. Un admin puede forzar la carga igual (override
+    explicito), por eso el llamador solo invoca esto para role == "profesor".
+    """
+    if tipo not in _TIPOS_NOTA_FINAL:
+        return
+    asistencia = calcular_porcentaje_asistencia(db, user_id, materia_id)
+    if asistencia["total_clases"] == 0:
+        return  # sin clases registradas todavia, no hay base para juzgar regularidad
+    minimo = asistencia_minima_institucional(db)
+    if asistencia["porcentaje"] < minimo:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"El alumno no cumple el minimo de asistencia requerido "
+                f"({asistencia['porcentaje']}% de {minimo}% ) -- no se puede "
+                f"cargar la nota final. Un admin puede forzar la carga."
+            ),
+        )
+
+
+@router.get("/pesos/{materia_id}", response_model=schemas.puntaje.PesoEvaluacionOut)
+def obtener_pesos_materia(
+    materia_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    """Puntaje máximo configurado por tipo para una materia (default 20/20/10/50 si no hay fila)."""
+    if current_user.role != "admin" and not es_profesor_de_materia(db, materia_id, current_user.user_id):
+        raise HTTPException(status_code=403, detail="No sos el profesor titular de esta materia")
+    pesos = get_pesos(db, materia_id)
+    fila = db.query(models.peso_evaluacion.PesoEvaluacion).filter(
+        models.peso_evaluacion.PesoEvaluacion.materia_id == materia_id
+    ).first()
+    return schemas.puntaje.PesoEvaluacionOut(
+        materia_id=materia_id,
+        parcial1_max=pesos["parcial1"],
+        parcial2_max=pesos["parcial2"],
+        practico_max=pesos["practico"],
+        final_max=pesos["final"],
+        updated_by=fila.updated_by if fila else None,
+        updated_at=fila.updated_at if fila else None,
+    )
+
+
+@router.put("/pesos/{materia_id}", response_model=schemas.puntaje.PesoEvaluacionOut)
+def actualizar_pesos_materia(
+    materia_id: int,
+    body: schemas.puntaje.PesoEvaluacionUpdate,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    """Admin o profesor titular de la materia configura el puntaje máximo por tipo (debe sumar 100)."""
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    materia = db.query(models.materia.Materia).filter(models.materia.Materia.id == materia_id).first()
+    if not materia:
+        raise HTTPException(status_code=404, detail="Materia no encontrada")
+    if current_user.role == "profesor" and not es_profesor_de_materia(db, materia_id, current_user.user_id):
+        raise HTTPException(status_code=403, detail="No sos el profesor titular de esta materia")
+
+    fila = db.query(models.peso_evaluacion.PesoEvaluacion).filter(
+        models.peso_evaluacion.PesoEvaluacion.materia_id == materia_id
+    ).first()
+    if not fila:
+        fila = models.peso_evaluacion.PesoEvaluacion(materia_id=materia_id)
+        db.add(fila)
+    fila.parcial1_max = body.parcial1_max
+    fila.parcial2_max = body.parcial2_max
+    fila.practico_max = body.practico_max
+    fila.final_max = body.final_max
+    fila.updated_by = current_user.user_id
+    db.commit()
+    db.refresh(fila)
+    return schemas.puntaje.PesoEvaluacionOut(
+        materia_id=materia_id,
+        parcial1_max=float(fila.parcial1_max),
+        parcial2_max=float(fila.parcial2_max),
+        practico_max=float(fila.practico_max),
+        final_max=float(fila.final_max),
+        updated_by=fila.updated_by,
+        updated_at=fila.updated_at,
+    )
+
+
+def _max_para_tipo(pesos: dict[str, float], tipo: str) -> float:
+    if tipo == "directa":
+        return 5  # nota final directa, entero 1-5 (Art. 24 Reglamento UCA)
+    clave = "final" if tipo.startswith("final") else tipo
+    return pesos.get(clave, 100)
+
+
+def _get_puntajes_por_materia(db: Session, materia_id: int):
+    """Retorna todos los puntajes de la oferta activa de una materia con datos del alumno."""  # noqa: E501
+    oferta_id = _oferta_activa_id(db, materia_id)
+    if oferta_id is None:
+        return []
+    return (
+        db.query(
+            models.puntaje.Puntaje,
+            models.user.User.nombre,
+            models.user.User.username,
+        )
+        .join(models.user.User, models.puntaje.Puntaje.user_id == models.user.User.id)
+        .filter(models.puntaje.Puntaje.oferta_materia_id == oferta_id)
+        .all()
+    )
+
+
+@router.post("/", response_model=schemas.puntaje.PuntajeOut)
+def create_puntaje(
+    puntaje: schemas.puntaje.PuntajeCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    user = (
+        db.query(models.user.User)
+        .filter(models.user.User.id == current_user.user_id)
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    # Verify profesor teaches this materia (unless admin)
+    if current_user.role == "profesor":
+        materia = (
+            db.query(models.materia.Materia)
+            .filter(models.materia.Materia.id == puntaje.materia_id)
+            .first()
+        )
+        if not materia:
+            raise HTTPException(status_code=404, detail="Materia no encontrada")
+        if not es_profesor_de_materia(db, puntaje.materia_id, current_user.user_id):
+            raise HTTPException(
+                status_code=403, detail="No sos el profesor titular de esta materia"
+            )
+        _verificar_regularidad(db, puntaje.user_id, puntaje.materia_id, puntaje.tipo)
+    oferta_id = _oferta_activa_id(db, puntaje.materia_id)
+    if oferta_id is None:
+        raise HTTPException(
+            status_code=404, detail="No hay oferta activa para esta materia"
+        )
+    pesos = get_pesos(db, puntaje.materia_id)
+    maximo = _max_para_tipo(pesos, puntaje.tipo)
+    if puntaje.valor > maximo:
+        raise HTTPException(
+            status_code=422,
+            detail=f"El valor máximo para '{puntaje.tipo}' en esta materia es {maximo}",
+        )
+    # Check for duplicate grade type
+    existing = (
+        db.query(models.puntaje.Puntaje)
+        .filter(
+            models.puntaje.Puntaje.user_id == puntaje.user_id,
+            models.puntaje.Puntaje.oferta_materia_id == oferta_id,
+            models.puntaje.Puntaje.tipo == puntaje.tipo,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ya existe una nota de tipo '{puntaje.tipo}' "
+            "para este alumno en esta materia",
+        )
+    # "directa" y desglose (parcial/practico/final) son mutuamente excluyentes
+    # -- calcular_promedio_final le da precedencia absoluta a "directa" si
+    # existe, asi que dejar la del modo contrario tirada silenciosamente
+    # anula cualquier nota nueva cargada en el otro modo. Se borra al vuelo.
+    tipo_contrario = (
+        models.puntaje.Puntaje.tipo != "directa"
+        if puntaje.tipo == "directa"
+        else models.puntaje.Puntaje.tipo == "directa"
+    )
+    db.query(models.puntaje.Puntaje).filter(
+        models.puntaje.Puntaje.user_id == puntaje.user_id,
+        models.puntaje.Puntaje.oferta_materia_id == oferta_id,
+        tipo_contrario,
+    ).delete(synchronize_session=False)
+    new_puntaje = models.puntaje.Puntaje(
+        user_id=puntaje.user_id,
+        oferta_materia_id=oferta_id,
+        tipo=puntaje.tipo,
+        valor=puntaje.valor,
+        felicitado=puntaje.felicitado,
+        editado_por=user.id,
+    )
+    db.add(new_puntaje)
+    db.commit()
+    db.refresh(new_puntaje)
+
+    target = (
+        db.query(models.user.User)
+        .filter(models.user.User.id == puntaje.user_id)
+        .first()
+    )
+    materia = (
+        db.query(models.materia.Materia)
+        .filter(models.materia.Materia.id == puntaje.materia_id)
+        .first()
+    )
+    if target and target.email and materia:
+        send_new_grade_email_bg(
+            background_tasks,
+            str(target.email),
+            str(target.nombre or target.username),
+            str(materia.nombre),
+            str(puntaje.tipo),
+            puntaje.valor,
+        )
+
+    return new_puntaje
+
+
+@router.get("/", response_model=list[schemas.puntaje.PuntajeOut])
+def list_puntajes(
+    user_id: Optional[int] = Query(None),
+    materia_id: Optional[int] = Query(None),
+    tipo: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=2000),
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    query = db.query(models.puntaje.Puntaje)
+    if current_user.role == "alumno":
+        query = query.filter(models.puntaje.Puntaje.user_id == current_user.user_id)
+    elif current_user.role == "profesor":
+        if user_id is not None:
+            if not es_profesor_de_alumno(db, current_user.user_id, user_id):
+                raise HTTPException(status_code=403, detail="No autorizado")
+            query = query.filter(models.puntaje.Puntaje.user_id == user_id)
+        else:
+            query = query.filter(
+                models.puntaje.Puntaje.user_id.in_(
+                    db.query(models.inscripcion.Inscripcion.alumno_id)
+                    .join(
+                        models.oferta_materia.OfertaMateria,
+                        models.oferta_materia.OfertaMateria.id
+                        == models.inscripcion.Inscripcion.oferta_materia_id,
+                    )
+                    .filter(
+                        models.oferta_materia.OfertaMateria.profesor_id == current_user.user_id,
+                        models.oferta_materia.OfertaMateria.activa == True,
+                    )
+                )
+            )
+    else:
+        if user_id is not None:
+            query = query.filter(models.puntaje.Puntaje.user_id == user_id)
+    if materia_id is not None:
+        oferta_id = _oferta_activa_id(db, materia_id)
+        query = query.filter(models.puntaje.Puntaje.oferta_materia_id == oferta_id)
+    if tipo is not None:
+        query = query.filter(models.puntaje.Puntaje.tipo == tipo)
+    query = query.order_by(models.puntaje.Puntaje.id).offset(skip).limit(limit)
+    return query.all()
+
+
+@router.put("/{puntaje_id}", response_model=schemas.puntaje.PuntajeOut)
+def update_puntaje(
+    puntaje_id: int,
+    puntaje: schemas.puntaje.PuntajeCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    user = (
+        db.query(models.user.User)
+        .filter(models.user.User.id == current_user.user_id)
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    existing = (
+        db.query(models.puntaje.Puntaje)
+        .filter(models.puntaje.Puntaje.id == puntaje_id)
+        .first()
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Puntaje no encontrado")
+    # Verify profesor owns this materia
+    if current_user.role == "profesor":
+        mid: int | None = existing.materia_id
+        if mid is None:
+            raise HTTPException(status_code=400, detail="Materia no asociada al puntaje")
+        if not es_profesor_de_materia(db, mid, current_user.user_id):
+            raise HTTPException(
+                status_code=403, detail="No sos el profesor titular de esta materia"
+            )
+        _verificar_regularidad(db, existing.user_id, mid, puntaje.tipo)
+    data = puntaje.model_dump()
+    nueva_materia_id = data.pop("materia_id")
+    data.pop("user_id", None)  # no reasignable: mass assignment hubiera permitido robar la nota a otro alumno
+    if nueva_materia_id != existing.materia_id:
+        nuevo_oferta_id = _oferta_activa_id(db, nueva_materia_id)
+        if nuevo_oferta_id is None:
+            raise HTTPException(
+                status_code=404, detail="No hay oferta activa para esta materia"
+            )
+        setattr(existing, 'oferta_materia_id', nuevo_oferta_id)
+    pesos = get_pesos(db, nueva_materia_id)
+    maximo = _max_para_tipo(pesos, data["tipo"])
+    if data["valor"] > maximo:
+        raise HTTPException(
+            status_code=422,
+            detail=f"El valor máximo para '{data['tipo']}' en esta materia es {maximo}",
+        )
+    if data["tipo"] != existing.tipo:
+        # Mismo motivo que en create_puntaje: "directa" y desglose son
+        # mutuamente excluyentes, se limpia el modo contrario al cambiar tipo.
+        tipo_contrario = (
+            models.puntaje.Puntaje.tipo != "directa"
+            if data["tipo"] == "directa"
+            else models.puntaje.Puntaje.tipo == "directa"
+        )
+        db.query(models.puntaje.Puntaje).filter(
+            models.puntaje.Puntaje.user_id == existing.user_id,
+            models.puntaje.Puntaje.oferta_materia_id == existing.oferta_materia_id,
+            models.puntaje.Puntaje.id != existing.id,
+            tipo_contrario,
+        ).delete(synchronize_session=False)
+    for key, value in data.items():
+        setattr(existing, key, value)
+    existing.editado_por = user.id
+    existing.editado_en = __import__("datetime").datetime.utcnow()
+    db.commit()
+    db.refresh(existing)
+
+    target = (
+        db.query(models.user.User)
+        .filter(models.user.User.id == existing.user_id)
+        .first()
+    )
+    materia = (
+        db.query(models.materia.Materia)
+        .filter(models.materia.Materia.id == existing.materia_id)
+        .first()
+    )
+    if target and target.email and materia:
+        send_new_grade_email_bg(
+            background_tasks,
+            str(target.email),
+            str(target.nombre or target.username),
+            str(materia.nombre),
+            str(existing.tipo),
+            float(str(existing.valor)),
+        )
+
+    return existing
+
+
+@router.delete("/{puntaje_id}")
+def delete_puntaje(
+    puntaje_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    existing = (
+        db.query(models.puntaje.Puntaje)
+        .filter(models.puntaje.Puntaje.id == puntaje_id)
+        .first()
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Puntaje no encontrado")
+    # Verify profesor owns this materia
+    if current_user.role == "profesor":
+        mid: int | None = existing.materia_id
+        if mid is None:
+            raise HTTPException(status_code=400, detail="Materia no asociada al puntaje")
+        if not es_profesor_de_materia(db, mid, current_user.user_id):
+            raise HTTPException(
+                status_code=403, detail="No sos el profesor titular de esta materia"
+            )
+    db.delete(existing)
+    db.commit()
+    return {"detail": "Puntaje eliminado"}
+
+
+@router.get(
+    "/materia/{materia_id}", response_model=list[schemas.puntaje.PromedioFinalOut]
+)
+def puntajes_por_materia(
+    materia_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    """Notas de todos los alumnos de una materia."""
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    # Verify profesor owns this materia
+    if current_user.role == "profesor":
+        if not es_profesor_de_materia(db, materia_id, current_user.user_id):
+            raise HTTPException(
+                status_code=403, detail="No sos el profesor titular de esta materia"
+            )
+
+    rows = _get_puntajes_por_materia(db, materia_id)
+    pesos = get_pesos(db, materia_id)
+    alumno_map: dict[int, dict] = {}
+    for p, nombre, username in rows:
+        if p.user_id not in alumno_map:
+            alumno_map[p.user_id] = {
+                "nombre": nombre,
+                "username": username,
+                "parcial1": None,
+                "parcial2": None,
+                "practico": None,
+                "final1": None,
+                "final2": None,
+                "final3": None,
+                "directa": None,
+                "felicitado": False,
+            }
+        if p.tipo in alumno_map[p.user_id]:
+            alumno_map[p.user_id][p.tipo] = float(p.valor)
+            if p.tipo == "directa":
+                alumno_map[p.user_id]["felicitado"] = bool(p.felicitado)
+
+    result = []
+    for uid, data in alumno_map.items():
+        prom = calcular_promedio_final(data, pesos)
+        result.append(
+            schemas.puntaje.PromedioFinalOut(user_id=uid, **data, promedio_final=prom)
+        )
+
+    return result
+
+
+@router.get(
+    "/alumno/{user_id}/promedio-final", response_model=schemas.puntaje.PromedioFinalOut
+)
+def promedio_final_alumno(
+    user_id: int,
+    materia_id: Optional[int] = Query(None),
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    """Promedio ponderado final de un alumno. Si materia_id es None, por cada materia."""  # noqa: E501
+    if current_user.role != "admin" and current_user.user_id != user_id:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    query = db.query(models.puntaje.Puntaje).filter(
+        models.puntaje.Puntaje.user_id == user_id
+    )
+    if materia_id is not None:
+        oferta_id = _oferta_activa_id(db, materia_id)
+        query = query.filter(models.puntaje.Puntaje.oferta_materia_id == oferta_id)
+    puntajes = query.all()
+
+    notas: dict[str, float | None] = {
+        "parcial1": None, "parcial2": None, "practico": None,
+        "final1": None, "final2": None, "final3": None, "directa": None,
+    }
+    felicitado = False
+    for p in puntajes:
+        if str(p.tipo) in notas:
+            notas[str(p.tipo)] = float(str(p.valor))
+            if str(p.tipo) == "directa":
+                felicitado = bool(p.felicitado)
+
+    alumno = db.query(models.user.User).filter(models.user.User.id == user_id).first()
+    nombre_val: str | None = getattr(alumno, 'nombre', None) if alumno else None
+    nombre: str = nombre_val if nombre_val else ""
+    pesos = get_pesos(db, materia_id)
+    prom = calcular_promedio_final(notas, pesos)
+
+    return schemas.puntaje.PromedioFinalOut(
+        user_id=user_id, nombre=nombre, **notas, felicitado=felicitado, promedio_final=prom
+    )
+
+
+@router.get(
+    "/materia/{materia_id}/exportar",
+    response_model=schemas.puntaje.ExportacionMateriaOut,
+)
+def exportar_materia(
+    materia_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    if current_user.role == "profesor" and not es_profesor_de_materia(db, materia_id, current_user.user_id):
+        raise HTTPException(status_code=403, detail="No sos el profesor titular de esta materia")
+
+    materia = db.query(models.materia.Materia).filter(models.materia.Materia.id == materia_id).first()
+    if not materia:
+        raise HTTPException(status_code=404, detail="Materia no encontrada")
+
+    rows = _get_puntajes_por_materia(db, materia_id)
+    pesos = get_pesos(db, materia_id)
+    alumno_map: dict[int, dict] = {}
+    for p, nombre, username in rows:
+        if p.user_id not in alumno_map:
+            alumno_map[p.user_id] = {
+                "nombre": nombre, "username": username,
+                "parcial1": None, "parcial2": None, "practico": None,
+                "final1": None, "final2": None, "final3": None,
+                "directa": None, "felicitado": False,
+            }
+        if p.tipo in alumno_map[p.user_id]:
+            alumno_map[p.user_id][p.tipo] = float(p.valor)
+            if p.tipo == "directa":
+                alumno_map[p.user_id]["felicitado"] = bool(p.felicitado)
+
+    asistencia_oferta_id = _oferta_activa_id(db, materia_id)
+    uids = list(alumno_map.keys())
+
+    # Batch attendance counts (single query)
+    from sqlalchemy import func, case
+    A = models.asistencia.Asistencia
+    asist_rows = (
+        db.query(
+            A.user_id,
+            func.count(A.id).label("total"),
+            func.sum(case((A.presente, 1), else_=0)).label("pres"),
+        )
+        .filter(A.user_id.in_(uids), A.oferta_materia_id == asistencia_oferta_id)
+        .group_by(A.user_id)
+        .all()
+    )
+    asist_map = {r.user_id: (r.total, r.pres) for r in asist_rows}
+
+    alumnos_out = []
+    for uid, data in alumno_map.items():
+        prom = calcular_promedio_final(data, pesos)
+        tot, pres = asist_map.get(uid, (0, 0))
+        asist_pct = round((pres / tot) * 100, 1) if tot > 0 else None
+        alumnos_out.append(schemas.puntaje.AlumnoExportRow(user_id=uid, **data, promedio=prom, asistencia_pct=asist_pct))
+
+    return schemas.puntaje.ExportacionMateriaOut(materia_id=materia_id, materia_nombre=str(materia.nombre), alumnos=alumnos_out)
+
+
+@router.get("/materia/{materia_id}/estadisticas")
+def estadisticas_materia(
+    materia_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role not in ("admin", "profesor"):
+        raise HTTPException(status_code=403, detail="No autorizado")
+    if current_user.role == "profesor" and not es_profesor_de_materia(db, materia_id, current_user.user_id):
+        raise HTTPException(status_code=403, detail="No sos el profesor titular de esta materia")
+
+    P = models.puntaje.Puntaje
+    oferta_id = _oferta_activa_id(db, materia_id)
+    if not oferta_id:
+        return {"materia_id": materia_id, "total_alumnos": 0, "promedio_grupo": 0,
+                "distribucion": {}, "aprobados": 0, "en_riesgo": 0}
+
+    filas = db.query(P).filter(P.oferta_materia_id == oferta_id).all()
+    if not filas:
+        return {"materia_id": materia_id, "total_alumnos": 0, "promedio_grupo": 0,
+                "distribucion": {}, "aprobados": 0, "en_riesgo": 0}
+
+    pesos = get_pesos(db, materia_id)
+    por_alumno: dict[int, dict] = {}
+    for p in filas:
+        d = por_alumno.setdefault(p.user_id, {
+            "parcial1": None, "parcial2": None, "practico": None,
+            "final1": None, "final2": None, "final3": None, "directa": None,
+        })
+        if p.tipo in d:
+            d[p.tipo] = float(p.valor)
+
+    promedios = [
+        prom for prom in (calcular_promedio_final(d, pesos) for d in por_alumno.values())
+        if prom is not None
+    ]
+    if not promedios:
+        return {"materia_id": materia_id, "total_alumnos": 0, "promedio_grupo": 0,
+                "distribucion": {}, "aprobados": 0, "en_riesgo": 0}
+    total_alumnos = len(promedios)
+    total_notas = len(filas)
+
+    # Distribucion por escalon real (1-5, Art. 24) -- promedios ya son enteros
+    # 1-5, no rangos 0-10 inventados.
+    distribucion = {str(n): sum(1 for v in promedios if v == n) for n in range(1, 6)}
+    aprobados = sum(1 for v in promedios if v >= APROBACION_MINIMA)
+    en_riesgo = total_alumnos - aprobados
+
+    return {
+        "materia_id": materia_id,
+        "total_alumnos": total_alumnos,
+        "total_notas": total_notas,
+        "promedio_grupo": round(sum(promedios) / total_alumnos, 2) if total_alumnos else 0,
+        "nota_maxima": max(promedios) if promedios else 0,
+        "nota_minima": min(promedios) if promedios else 0,
+        "distribucion": distribucion,
+        "aprobados": aprobados,
+        "en_riesgo": en_riesgo,
+    }
+
+
+# Keep this route last to avoid catching other /materia/ routes
+@router.get("/{user_id}/promedio")
+def promedio_puntajes(
+    user_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role != "admin" and current_user.user_id != user_id:
+        raise HTTPException(status_code=403, detail="No autorizado")
+    # Promedio real (pesos reales por materia, promedio de promedios) -- no un
+    # AVG crudo sobre todos los tipos/materias, que mezclaria escalas
+    # distintas (parcial max 20, final max 50, directa 0-10) sin sentido.
+    promedios = promedios_por_alumno(db, [user_id])
+    if user_id not in promedios:
+        raise HTTPException(status_code=404, detail="No se encontraron puntajes para este usuario")
+    total_puntajes = (
+        db.query(models.puntaje.Puntaje)
+        .filter(models.puntaje.Puntaje.user_id == user_id)
+        .count()
+    )
+    return {"user_id": user_id, "promedio": promedios[user_id], "total_puntajes": total_puntajes}

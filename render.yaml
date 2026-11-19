@@ -1,0 +1,106 @@
+services:
+  - type: web
+    name: uca-v2-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requeriments.txt && alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /docs
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRES_MINUTES
+        value: "480"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: CSRF_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: API_KEYS
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_TOKEN
+        sync: false
+      - key: RATE_LIMIT_AUTH_LOGIN
+        value: "15/60"
+      - key: RATE_LIMIT_AUTH_REGISTER
+        value: "6/60minutes"
+      - key: RATE_LIMIT_PASSWORD_RESET
+        value: "6/15minutes"
+      - key: RATE_LIMIT_EXCLUDE_PATHS
+        value: "/health,/version,/metrics,/"
+      - key: RATE_LIMIT_EXCLUDE_PREFIXES
+        value: "/static,/docs,/openapi.json,/redoc"
+      - key: EMAIL_PROVIDER
+        value: "auto"
+      - key: EMAIL_FROM
+        sync: false
+      - key: EMAIL_FROM_NAME
+        value: "Sistema Académico UCA"
+      - key: EMAIL_MAX_ATTEMPTS
+        value: "3"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: RESET_TOKEN_EXPIRATION_MINUTES
+        value: "60"
+      - key: FRONTEND_URL
+        sync: false
+      - key: RESET_PASSWORD_FRONTEND_URL
+        sync: false
+      - key: MAIL_USERNAME
+        sync: false
+      - key: MAIL_PASSWORD
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: MAIL_PORT
+        value: "587"
+      - key: MAIL_SERVER
+        value: smtp.gmail.com
+      - key: MAIL_STARTTLS
+        value: "True"
+      - key: MAIL_SSL_TLS
+        value: "False"
+      - key: USE_CREDENTIALS
+        value: "True"
+      - key: VALIDATE_CERTS
+        value: "True"
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: GUARANI_APP_API_KEY
+        sync: false
+      - key: GUARANI_APP_PUNTO_EMISION
+        sync: false
+      - key: GUARANI_APP_BASE_URL
+        value: https://api.guarani.app/v1
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_CLAIM_EMAIL
+        sync: false
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false

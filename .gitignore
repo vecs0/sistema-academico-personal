@@ -1,0 +1,75 @@
+# Variables de entorno - NUNCA subir al repo
+.env
+.env.local
+.env.production
+.env.staging
+
+# Dependencias
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build
+dist/
+build/
+.next/
+
+# Editores
+.vscode/settings.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+
+# Docker volumes locales
+postgres_data/
+
+# Base de datos SQLite local
+*.db
+*.sqlite
+*.sqlite3
+
+# Skills globales de Claude
+skills/
+
+# Sesiones de Claude / IDE local
+.claude/
+
+# Archivos de borrador
+mark.txt
+
+# Backups de DB locales (pueden contener datos sensibles)
+backend/backup_*.json
+
+# Venv de Python (backend)
+backend/venv/
+venv/
+
+# uploaded avatars (runtime user content)
+backend/static/avatars/*
+!backend/static/avatars/.gitkeep
+
+# Archivos de asistentes de IA (solo locales)
+CLAUDE.md
+AGENTS.md
+.claude/
+.opencode/
+
+# Documentación comercial (solo local)
+docs/negocio/
+
+# Scripts sueltos de refactor
+fix-colors.js
+fix-refactor.js
+refactor.js

@@ -1,0 +1,415 @@
+// Alumno, Profesor y Admin. Calendario académico (eventos globales/por materia). Depende de: /eventos/*.
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { api, emitToast, getCurrentUser } from '../lib/api'
+
+const POLL_MS = 30000
+
+const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+const DIAS = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+
+type TipoEvento = 'parcial' | 'parcial_1' | 'parcial_2' | 'final' | 'feriado' | 'asueto' | 'entrega' | 'actividad'
+type Evento = { id?: number; titulo: string; tipo: TipoEvento; fecha: string; fecha_fin?: string | null; descripcion?: string | null; materia_id?: number | null; hora?: string | null; ubicacion?: string | null }
+type MateriaSimple = { id: number; nombre: string; codigo: string | null; carrera: string | null }
+
+const tipoCfg: Record<TipoEvento, { color: string; bg: string; label: string; badge: string }> = {
+  parcial:   { color: '#f87171', bg: 'rgba(239,68,68,0.15)', label: 'Parcial', badge: 'URGENTE' },
+  parcial_1: { color: '#f87171', bg: 'rgba(239,68,68,0.15)', label: 'Parcial 1', badge: 'PARCIAL' },
+  parcial_2: { color: '#fb923c', bg: 'rgba(251,146,60,0.15)', label: 'Parcial 2', badge: 'PARCIAL' },
+  final:     { color: '#ef4444', bg: 'rgba(239,68,68,0.20)', label: 'Final', badge: 'URGENTE' },
+  entrega:   { color: '#fbbf24', bg: 'rgba(245,158,11,0.15)', label: 'Entrega', badge: 'ENTREGA' },
+  feriado:   { color: '#94a3b8', bg: 'rgba(148,163,184,0.15)', label: 'Feriado', badge: 'FERIADO' },
+  asueto:    { color: '#34d399', bg: 'rgba(16,185,129,0.15)', label: 'Asueto', badge: 'SOCIAL' },
+  actividad: { color: 'var(--accent-bright)', bg: 'var(--accent-muted)', label: 'Clase', badge: 'CLASE' },
+}
+
+const css = `
+  .cal-grid-page { display:grid; grid-template-columns:1fr 280px; gap:18px; align-items:start; }
+  .cal-month { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+  .cal-dia-lbl { text-align:center; font-family:var(--font-mono); font-size:10px; font-weight:700; color:var(--text-muted); text-transform:uppercase; padding:6px 0; }
+  .cal-cell {
+    min-height:86px; border-radius:10px; padding:6px; cursor:pointer;
+    background:var(--bg-input); border:1px solid transparent; transition:all .12s;
+    display:flex; flex-direction:column; gap:3px; overflow:hidden;
+  }
+  .cal-cell:hover { border-color:var(--border-light); }
+  .cal-cell.fuera { opacity:.28; pointer-events:none; }
+  .cal-cell.hoy { border-color:var(--accent); }
+  .cal-cell.sel { background:var(--bg-elevated); border-color:var(--accent-bright); }
+  .cal-num { font-family:var(--font-mono); font-size:11px; font-weight:700; color:var(--text-secondary); }
+  .cal-chip {
+    font-size:9px; font-weight:700; border-radius:4px; padding:2px 5px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    border-left:2px solid;
+  }
+  .cal-dot { display:none; width:5px; height:5px; border-radius:50%; }
+  .prox-item { border-radius:12px; background:var(--bg-elevated); padding:11px 13px; margin-bottom:10px; }
+  .cal-timeline { display:none; }
+  .cal-last-upd { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-muted); font-family:var(--font-mono); }
+  .cal-last-upd i.spin { animation:cal-spin 1s linear infinite; }
+  @keyframes cal-spin { to { transform:rotate(360deg); } }
+  .cal-err-banner {
+    display:flex; align-items:center; gap:8px; background:#ef444415; border:1px solid #ef444440;
+    color:#ef4444; border-radius:10px; padding:10px 14px; font-size:12.5px; font-weight:600; margin-bottom:16px;
+  }
+  @media(max-width:1024px){ .cal-grid-page { grid-template-columns:1fr; } }
+  @media(max-width:768px){
+    .cal-timeline { display:block; }
+    .cal-month-card { padding:10px !important; }
+    .cal-cell { min-height:38px; padding:3px; gap:2px; border-radius:8px; }
+    .cal-dia-lbl { font-size:9px; padding:4px 0; }
+    .cal-num { font-size:10.5px; }
+    .cal-chip { display:none; }
+    .cal-dot { display:block; }
+  }
+`
+
+function dateKey(y: number, m: number, d: number) {
+  return `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+}
+
+export default function Calendario() {
+  const hoy = new Date()
+  const [actual, setActual] = useState(new Date(hoy.getFullYear(), hoy.getMonth(), 1))
+  const [eventos, setEventos] = useState<Evento[]>([])
+  const [selDia, setSelDia] = useState<string | null>(null)
+  const [verTodosProximos, setVerTodosProximos] = useState(false)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [draft, setDraft] = useState<Evento>({ titulo: '', tipo: 'actividad', fecha: hoy.toISOString().slice(0, 10), descripcion: '', materia_id: undefined, hora: '', ubicacion: '' })
+  const [saving, setSaving] = useState(false)
+  const [cargandoPdf, setCargandoPdf] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [error, setError] = useState('')
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
+  const [materias, setMaterias] = useState<MateriaSimple[]>([])
+  const pdfInputRef = useRef<HTMLInputElement>(null)
+  const firstLoad = useRef(true)
+  const role = getCurrentUser()?.role
+
+  function onPdfSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (file.type !== 'application/pdf') { emitToast('Seleccioná un archivo PDF', 'warning'); return }
+    setCargandoPdf(true)
+    const reader = new FileReader()
+    reader.onload = async () => {
+      try {
+        const base64 = String(reader.result).split(',')[1]
+        const res = await api.post<{ procesados: number; errores: string[] }>('/eventos/cargar-pdf', {
+          pdf_base64: base64,
+          nombre_archivo: file.name,
+          anio: y,
+          semestre: m < 6 ? 1 : 2,
+        })
+        emitToast(`${res.procesados} eventos cargados desde el PDF`)
+        if (res.errores?.length) emitToast(`${res.errores.length} eventos con error`, 'warning')
+        cargar()
+      } catch (err) {
+        emitToast(err instanceof Error ? err.message : 'Error al procesar el PDF (verificá GEMINI_API_KEY)', 'error')
+      } finally {
+        setCargandoPdf(false)
+      }
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const cargar = useCallback(async (manual = false) => {
+    if (manual) setRefreshing(true)
+    if (firstLoad.current) setLoading(true)
+    try {
+      const res = await api.get<Evento[]>('/eventos/')
+      setEventos(res)
+      setError('')
+      setLastUpdate(new Date())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'No se pudieron cargar los eventos. Mostrando último dato disponible.')
+    } finally {
+      setLoading(false)
+      setRefreshing(false)
+      firstLoad.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    cargar()
+    if (role === 'profesor') {
+      api.get<MateriaSimple[]>('/profesor/materias').then(setMaterias).catch(() => {})
+    }
+    const id = setInterval(() => cargar(), POLL_MS)
+    return () => clearInterval(id)
+  }, [cargar, role])
+
+  const y = actual.getFullYear(), m = actual.getMonth()
+  const primerDia = (new Date(y, m, 1).getDay() + 6) % 7 // lunes=0
+  const diasMes = new Date(y, m + 1, 0).getDate()
+  const celdas: { d: number; fuera: boolean; key: string }[] = []
+  const prevDias = new Date(y, m, 0).getDate()
+  for (let i = primerDia - 1; i >= 0; i--) celdas.push({ d: prevDias - i, fuera: true, key: '' })
+  for (let d = 1; d <= diasMes; d++) celdas.push({ d, fuera: false, key: dateKey(y, m, d) })
+  while (celdas.length % 7 !== 0) celdas.push({ d: celdas.length, fuera: true, key: '' })
+
+  const porDia = (k: string) => eventos.filter(e => e.fecha === k)
+  const hoyKey = dateKey(hoy.getFullYear(), hoy.getMonth(), hoy.getDate())
+  const proximosTodos = [...eventos].filter(e => e.fecha >= hoyKey).sort((a, b) => a.fecha.localeCompare(b.fecha))
+  const proximos = verTodosProximos ? proximosTodos : proximosTodos.slice(0, 5)
+  const delMes = eventos.filter(e => e.fecha.startsWith(`${y}-${String(m + 1).padStart(2, '0')}`)).sort((a, b) => a.fecha.localeCompare(b.fecha))
+
+  async function guardarEvento() {
+    if (!draft.titulo || !draft.fecha) { emitToast('Completá título y fecha', 'warning'); return }
+    setSaving(true)
+    const body: Record<string, unknown> = { titulo: draft.titulo, tipo: draft.tipo, fecha: draft.fecha, descripcion: draft.descripcion || null }
+    if (draft.materia_id) body.materia_id = draft.materia_id
+    if (draft.hora) body.hora = draft.hora
+    if (draft.ubicacion) body.ubicacion = draft.ubicacion
+    body.anio = y
+    body.semestre = m < 6 ? 1 : 2
+    try {
+      await api.post('/eventos/', body)
+      emitToast('Evento agendado')
+      setModalOpen(false)
+      setDraft({ titulo: '', tipo: 'actividad', fecha: hoy.toISOString().slice(0, 10), descripcion: '', materia_id: undefined, hora: '', ubicacion: '' })
+      cargar()
+    } catch (e) {
+      emitToast(e instanceof Error ? e.message : 'Error al crear evento', 'error')
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <>
+      <style>{css}</style>
+
+      <div className="page-head">
+        <div>
+          <div className="page-eyebrow">{loading ? 'Cargando…' : `${delMes.length} evento${delMes.length === 1 ? '' : 's'} este mes`}</div>
+          <h1 className="page-title">{MESES[m]} {y}</h1>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {lastUpdate && (
+            <span className="cal-last-upd">
+              <i className={`ti ti-refresh${refreshing ? ' spin' : ''}`} />
+              {lastUpdate.toLocaleTimeString('es-PY')}
+            </span>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn-ghost" onClick={() => setActual(new Date(y, m - 1, 1))} aria-label="Mes anterior"><i className="ti ti-chevron-left" /></button>
+            <button className="btn-ghost" onClick={() => setActual(new Date(hoy.getFullYear(), hoy.getMonth(), 1))}>Hoy</button>
+            <button className="btn-ghost" onClick={() => setActual(new Date(y, m + 1, 1))} aria-label="Mes siguiente"><i className="ti ti-chevron-right" /></button>
+            <button className="btn-ghost" onClick={() => cargar(true)} disabled={refreshing}>
+              <i className={`ti ti-refresh${refreshing ? ' spin' : ''}`} /> {refreshing ? 'Actualizando…' : 'Actualizar'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="cal-err-banner">
+          <i className="ti ti-alert-circle" style={{ flexShrink: 0 }} />
+          {error}
+        </div>
+      )}
+
+      <div className="cal-grid-page">
+        <div>
+          {/* Grid mensual desktop */}
+          <div className="card cal-month-card" style={{ padding: 14 }}>
+            <div className="cal-month" style={{ marginBottom: 4 }}>
+              {DIAS.map(d => <div key={d} className="cal-dia-lbl">{d}</div>)}
+            </div>
+            <div className="cal-month">
+              {celdas.map((c, i) => {
+                const evs = c.key ? porDia(c.key) : []
+                return (
+                  <div key={i}
+                    className={`cal-cell${c.fuera ? ' fuera' : ''}${c.key === hoyKey ? ' hoy' : ''}${c.key === selDia ? ' sel' : ''}`}
+                    onClick={() => !c.fuera && setSelDia(c.key === selDia ? null : c.key)}>
+                    <span className="cal-num" style={c.key === hoyKey ? { color: 'var(--accent-bright)' } : undefined}>{c.d}</span>
+                    {evs.length > 0 && (
+                      <span className="cal-dot" style={{ background: (tipoCfg[evs[0].tipo] ?? tipoCfg.actividad).color }} />
+                    )}
+                    {evs.slice(0, 2).map(e => {
+                      const cfg = tipoCfg[e.tipo] ?? tipoCfg.actividad
+                      return <span key={e.id} className="cal-chip" style={{ background: cfg.bg, color: cfg.color, borderLeftColor: cfg.color }}>{cfg.label}: {e.titulo}</span>
+                    })}
+                    {evs.length > 2 && <span className="mono-label" style={{ fontSize: 8.5 }}>+{evs.length - 2} más</span>}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Timeline mobile */}
+          <div className="cal-timeline">
+            {delMes.length === 0 ? (
+              <div className="card" style={{ textAlign: 'center', color: 'var(--text-secondary)', fontSize: 13 }}>Sin eventos este mes.</div>
+            ) : delMes.map(e => {
+              const cfg = tipoCfg[e.tipo] ?? tipoCfg.actividad
+              return (
+                <div key={e.id} className="card" style={{ padding: '12px 16px', marginBottom: 10, borderLeft: `3px solid ${cfg.color}` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <span className="badge" style={{ background: cfg.bg, color: cfg.color }}>{cfg.badge}</span>
+                    <span className="mono-label">{e.fecha.slice(8, 10)}/{e.fecha.slice(5, 7)}</span>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>{e.titulo}</div>
+                  {(e.hora || e.ubicacion) && (
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 1 }}>
+                      {e.hora?.slice(0, 5)}{e.hora && e.ubicacion ? ' · ' : ''}{e.ubicacion}
+                    </div>
+                  )}
+                  {e.descripcion && <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>{e.descripcion}</div>}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Detalle día seleccionado */}
+          {selDia && (
+            <div className="card" style={{ marginTop: 14 }}>
+              <h3 style={{ fontSize: 14, fontWeight: 800, marginBottom: 10 }}>
+                Eventos del {selDia.slice(8, 10)}/{selDia.slice(5, 7)}
+              </h3>
+              {porDia(selDia).length === 0 ? (
+                <p style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Sin eventos. Usá "Agendar Evento" para crear uno.</p>
+              ) : porDia(selDia).map(e => {
+                const cfg = tipoCfg[e.tipo] ?? tipoCfg.actividad
+                return (
+                  <div key={e.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid var(--border-subtle)' }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: cfg.color }} />
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>{e.titulo}</div>
+                      <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                        {e.hora && <span>{e.hora.slice(0, 5)}{e.ubicacion ? ' · ' : ''}</span>}
+                        {e.ubicacion && <span>{e.ubicacion}</span>}
+                      </div>
+                      {e.descripcion && <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>{e.descripcion}</div>}
+                    </div>
+                    <span className="badge" style={{ background: cfg.bg, color: cfg.color }}>{cfg.label}</span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Panel derecho */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div className="card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ fontSize: 15, fontWeight: 800 }}>Próximos</h3>
+              {proximosTodos.length > 5 && (
+                <button
+                  className="mono-label"
+                  style={{ color: 'var(--accent-bright)', cursor: 'pointer', background: 'none', border: 'none', padding: 0 }}
+                  onClick={() => setVerTodosProximos(v => !v)}>
+                  {verTodosProximos ? 'Ver menos' : 'Ver todo'}
+                </button>
+              )}
+            </div>
+            {proximos.length === 0 ? (
+              <p style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>Sin eventos próximos.</p>
+            ) : (
+              <div style={verTodosProximos ? { maxHeight: 420, overflowY: 'auto', paddingRight: 4 } : undefined}>
+                {proximos.map(e => {
+                  const cfg = tipoCfg[e.tipo] ?? tipoCfg.actividad
+                  return (
+                    <div key={e.id} className="prox-item">
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                        <span className="badge" style={{ background: cfg.bg, color: cfg.color }}>{cfg.badge}</span>
+                        <span className="mono-label" style={{ fontSize: 9 }}>{e.fecha.slice(8, 10)}/{e.fecha.slice(5, 7)}</span>
+                      </div>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>{e.titulo}</div>
+                      {(e.hora || e.ubicacion) && (
+                        <div style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 1 }}>
+                          {e.hora?.slice(0, 5)}{e.hora && e.ubicacion ? ' · ' : ''}{e.ubicacion}
+                        </div>
+                      )}
+                      {e.descripcion && <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 2 }}>{e.descripcion}</div>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          {(role === 'admin' || role === 'profesor') && (
+            <button className="card" onClick={() => setModalOpen(true)}
+              style={{ cursor: 'pointer', textAlign: 'center', borderStyle: 'dashed', color: 'var(--text-secondary)' }}>
+              <i className="ti ti-circle-plus" style={{ fontSize: 24, display: 'block', marginBottom: 6, color: 'var(--accent-bright)' }} />
+              <span style={{ fontSize: 14, fontWeight: 800, color: 'var(--text-primary)' }}>Agendar Evento</span>
+              <div style={{ fontSize: 11.5, marginTop: 3 }}>Presiona para crear un nuevo recordatorio</div>
+            </button>
+          )}
+
+          {role === 'admin' && (
+            <div className="card" style={{ padding: '14px 16px' }}>
+              <div className="mono-label" style={{ marginBottom: 6 }}>Carga automática (PDF)</div>
+              <p style={{ fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: 10 }}>
+                Subí el calendario del semestre en PDF. Gemini extrae los eventos automáticamente.
+              </p>
+              <input ref={pdfInputRef} type="file" accept="application/pdf" style={{ display: 'none' }} onChange={onPdfSelected} />
+              <button className="btn-ghost" style={{ width: '100%' }} disabled={cargandoPdf} onClick={() => pdfInputRef.current?.click()}>
+                <i className={`ti ${cargandoPdf ? 'ti-loader-2' : 'ti-file-upload'}`} style={cargandoPdf ? { animation: 'spin 1s linear infinite' } : undefined} />
+                {cargandoPdf ? 'Procesando…' : 'Subir PDF del semestre'}
+              </button>
+              <style>{'@keyframes spin{to{transform:rotate(360deg)}}'}</style>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Modal agendar */}
+      {modalOpen && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.7)', backdropFilter: 'blur(4px)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+          <div className="card card-elevated" style={{ width: '100%', maxWidth: 420 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 800 }}>Agendar Evento</h3>
+              <button onClick={() => setModalOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}><i className="ti ti-x" /></button>
+            </div>
+            <div className="mono-label" style={{ marginBottom: 6 }}>Título</div>
+            <input className="input-uca" value={draft.titulo} onChange={e => setDraft(d => ({ ...d, titulo: e.target.value }))} style={{ marginBottom: 12 }} autoFocus />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <div>
+                <div className="mono-label" style={{ marginBottom: 6 }}>Tipo</div>
+                <select className="input-uca" value={draft.tipo} onChange={e => setDraft(d => ({ ...d, tipo: e.target.value as TipoEvento }))}>
+                  {(role === 'profesor'
+                    ? [['parcial_1', 'Parcial 1'], ['parcial_2', 'Parcial 2']]
+                    : Object.entries(tipoCfg).map(([k, v]) => [k, v.label])
+                  ).map(([k, label]) => <option key={k} value={k}>{label as string}</option>)}
+                </select>
+              </div>
+              <div>
+                <div className="mono-label" style={{ marginBottom: 6 }}>Fecha</div>
+                <input className="input-uca" type="date" value={draft.fecha} onChange={e => setDraft(d => ({ ...d, fecha: e.target.value }))} />
+              </div>
+            </div>
+            {role === 'profesor' && materias.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div className="mono-label" style={{ marginBottom: 6 }}>Materia</div>
+                <select className="input-uca" value={draft.materia_id ?? ''} onChange={e => setDraft(d => ({ ...d, materia_id: e.target.value ? Number(e.target.value) : undefined }))}>
+                  <option value="">Sin materia</option>
+                  {materias.map(m => <option key={m.id} value={m.id}>{m.nombre}{m.carrera ? ` (${m.carrera})` : ''}</option>)}
+                </select>
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+              <div>
+                <div className="mono-label" style={{ marginBottom: 6 }}>Hora</div>
+                <input className="input-uca" type="time" value={draft.hora ?? ''} onChange={e => setDraft(d => ({ ...d, hora: e.target.value || null }))} />
+              </div>
+              <div>
+                <div className="mono-label" style={{ marginBottom: 6 }}>Ubicación</div>
+                <input className="input-uca" value={draft.ubicacion ?? ''} onChange={e => setDraft(d => ({ ...d, ubicacion: e.target.value }))} placeholder="Aula, salón…" />
+              </div>
+            </div>
+            <div className="mono-label" style={{ marginBottom: 6 }}>Descripción</div>
+            <input className="input-uca" value={draft.descripcion ?? ''} onChange={e => setDraft(d => ({ ...d, descripcion: e.target.value }))} style={{ marginBottom: 18 }} placeholder="Detalle adicional…" />
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn-ghost" onClick={() => setModalOpen(false)}>Cancelar</button>
+              <button className="btn-primary" disabled={saving} onClick={guardarEvento}>{saving ? 'Guardando…' : 'Agendar'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}

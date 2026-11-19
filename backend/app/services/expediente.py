@@ -1,0 +1,209 @@
+"""services/expediente.py — cálculo de PPA (promedio ponderado acumulado)
+y regularidad académica a partir del expediente cerrado (ExpedienteMateria).
+
+Depende de: nada externo (solo modelos ORM) + puntajes_utils (redondeo).
+Usado por: services/graduacion.py (condición de egreso),
+routers/expediente_router.py, boleta_router.py.
+Recibe el entero 1-5 (Art. 24 Reglamento UCA) ya calculado por
+puntajes_utils.calcular_promedio_final al cerrar cada materia — no recalcula
+puntos, solo agrega/promedia.
+"""
+from sqlalchemy.orm import Session
+from app.models.expediente_materia import ExpedienteMateria
+from app.models.oferta_materia import OfertaMateria
+from app.models.inscripcion import Inscripcion
+from app.models.asistencia import Asistencia
+from app.models.materia import Materia
+from app.models.global_settings import GlobalSetting
+from app.services.puntajes_utils import APROBACION_MINIMA, redondear_half_up
+from app.services.asistencia_utils import puntaje_asistencia_sql, PUNTAJE_PRESENTE
+
+# PPA_UMBRAL_RIESGO: PPA solo promedia 'aprobada' (siempre nota>=APROBACION_MINIMA),
+# asi que un umbral igual a APROBACION_MINIMA nunca dispara -- un escalon arriba
+# marca "aprobado pero flojo" (misma logica que el 7.0 original sobre el 6.0 en
+# la escala vieja 0-10, ahora 3 sobre el 2 en la escala 1-5).
+PPA_UMBRAL_RIESGO = APROBACION_MINIMA + 1
+ASISTENCIA_UMBRAL_RIESGO = 75  # % -- fallback si el GlobalSetting no existe aun
+PLAZO_RECURSAR_PERIODOS = 2
+PERIODOS_INACTIVIDAD_BAJA = 3
+
+
+def asistencia_minima_institucional(db: Session) -> float:
+    """% de asistencia minimo, leido de GlobalSetting (categoria academico,
+    key "porcentaje_asistencia_minimo") -- configurable por el admin en Ajustes
+    Globales, no hardcodeado. Fallback a ASISTENCIA_UMBRAL_RIESGO si el setting
+    todavia no existe en la DB (ver settings_router.py::_seed_defaults, que
+    recien inserta los defaults la primera vez que se abre Ajustes Globales).
+    Mismo patron que graduacion.py::ppa_minimo_institucional.
+    """
+    setting = db.query(GlobalSetting).filter_by(key="porcentaje_asistencia_minimo").first()
+    if setting and setting.value:
+        try:
+            return float(setting.value)
+        except ValueError:
+            pass
+    return float(ASISTENCIA_UMBRAL_RIESGO)
+
+
+def calcular_ppa(alumno_id: int, db: Session) -> dict:
+    """
+    PPA = Sum(nota_final * creditos) / Sum(creditos)
+    sobre expediente_materias aprobadas, redondeado a ENTERO (round-half-up)
+    -- el PPA institucional es un entero puro en escala 1-5, no un decimal.
+
+    Devuelve {"ppa": int|None, "creditos_computados": int}. ppa es None
+    (nunca 0) si el alumno no tiene ninguna materia aprobada en su expediente.
+    """
+    aprobadas = (
+        db.query(ExpedienteMateria)
+        .filter(
+            ExpedienteMateria.alumno_id == alumno_id,
+            ExpedienteMateria.condicion == "aprobada",
+        )
+        .all()
+    )
+    if not aprobadas:
+        return {"ppa": None, "creditos_computados": 0}
+
+    creditos_totales = sum(a.creditos for a in aprobadas)
+    if creditos_totales == 0:
+        return {"ppa": None, "creditos_computados": 0}
+
+    ponderado = sum(float(a.nota_final) * a.creditos for a in aprobadas)
+    return {
+        "ppa": redondear_half_up(ponderado / creditos_totales),
+        "creditos_computados": creditos_totales,
+    }
+
+
+def calcular_regularidad(alumno_id: int, db: Session) -> dict:
+    """Clasifica al alumno en activo/en_riesgo/irregular/de_baja.
+
+    Precedencia (mas severo gana): de_baja > irregular > en_riesgo > activo.
+    Devuelve {"estado": str, "motivo": str|None, "ppa_acumulado": float|None}.
+    """
+    ppa_info = calcular_ppa(alumno_id, db)
+    ppa = ppa_info["ppa"]
+
+    periodos_sistema = sorted(
+        {p for (p,) in db.query(OfertaMateria.periodo).distinct().all()}
+    )
+    periodos_alumno = sorted(
+        {
+            p
+            for (p,) in db.query(OfertaMateria.periodo)
+            .join(Inscripcion, Inscripcion.oferta_materia_id == OfertaMateria.id)
+            .filter(Inscripcion.alumno_id == alumno_id)
+            .distinct()
+            .all()
+        }
+    )
+
+    # 1. De baja: sin inscripciones en los ultimos N periodos del sistema.
+    # Se salta si el sistema todavia no tiene suficiente historia (< N periodos distintos).  # noqa: E501
+    if len(periodos_sistema) >= PERIODOS_INACTIVIDAD_BAJA:
+        recientes = set(periodos_sistema[-PERIODOS_INACTIVIDAD_BAJA:])
+        if not (set(periodos_alumno) & recientes):
+            return {
+                "estado": "de_baja",
+                "motivo": f"Sin inscripciones en los ultimos {PERIODOS_INACTIVIDAD_BAJA} periodos",  # noqa: E501
+                "ppa_acumulado": ppa,
+            }
+
+    # 2. Irregular: materia reprobada fuera de plazo sin recursar y aprobar despues.
+    if periodos_alumno:
+        idx_reciente = periodos_sistema.index(periodos_alumno[-1])
+        reprobadas = (
+            db.query(ExpedienteMateria)
+            .filter(
+                ExpedienteMateria.alumno_id == alumno_id,
+                ExpedienteMateria.condicion == "reprobada",
+            )
+            .all()
+        )
+
+        ofertas_reprobadas = {
+            o.id: o
+            for o in db.query(OfertaMateria).filter(
+                OfertaMateria.id.in_([r.oferta_materia_id for r in reprobadas])
+            )
+        }
+
+        candidatas = []  # (r, oferta_r) que superaron el plazo de recursado
+        for r in reprobadas:
+            oferta_r = ofertas_reprobadas.get(r.oferta_materia_id)
+            if not oferta_r or oferta_r.periodo not in periodos_sistema:
+                continue
+            idx_r = periodos_sistema.index(oferta_r.periodo)
+            if idx_reciente - idx_r <= PLAZO_RECURSAR_PERIODOS:
+                continue
+            candidatas.append((r, oferta_r))
+
+        if candidatas:
+            materia_ids = {oferta_r.materia_id for _, oferta_r in candidatas}
+            materias_con_aprobada = {
+                oferta_id
+                for (oferta_id,) in db.query(OfertaMateria.materia_id)
+                .join(
+                    ExpedienteMateria,
+                    ExpedienteMateria.oferta_materia_id == OfertaMateria.id,
+                )
+                .filter(
+                    ExpedienteMateria.alumno_id == alumno_id,
+                    ExpedienteMateria.condicion == "aprobada",
+                    OfertaMateria.materia_id.in_(materia_ids),
+                )
+                .distinct()
+            }
+
+            pendientes = [
+                oferta_r
+                for _, oferta_r in candidatas
+                if oferta_r.materia_id not in materias_con_aprobada
+            ]
+            if pendientes:
+                oferta_r = pendientes[0]
+                materia = (
+                    db.query(Materia)
+                    .filter(Materia.id == oferta_r.materia_id)
+                    .first()
+                )
+                nombre = (
+                    materia.nombre if materia else f"materia #{oferta_r.materia_id}"
+                )
+                return {
+                    "estado": "irregular",
+                    "motivo": f"{nombre} reprobada, sin recursar en {PLAZO_RECURSAR_PERIODOS} periodos",  # noqa: E501
+                    "ppa_acumulado": ppa,
+                }
+
+    # 3. En riesgo: PPA bajo umbral o asistencia global < umbral.
+    if ppa is not None and ppa < PPA_UMBRAL_RIESGO:
+        return {
+            "estado": "en_riesgo",
+            "motivo": f"PPA {ppa} < {PPA_UMBRAL_RIESGO}",
+            "ppa_acumulado": ppa,
+        }
+
+    from sqlalchemy import func
+
+    total_asistencias = (
+        db.query(Asistencia).filter(Asistencia.user_id == alumno_id).count()
+    )
+    if total_asistencias:
+        suma_puntos = (
+            db.query(func.sum(puntaje_asistencia_sql(Asistencia)))
+            .filter(Asistencia.user_id == alumno_id)
+            .scalar()
+        ) or 0
+        pct = round(suma_puntos / total_asistencias / PUNTAJE_PRESENTE * 100)
+        umbral = asistencia_minima_institucional(db)
+        if pct < umbral:
+            return {
+                "estado": "en_riesgo",
+                "motivo": f"Asistencia {pct}% < {umbral}%",
+                "ppa_acumulado": ppa,
+            }
+
+    # 4. Activo
+    return {"estado": "activo", "motivo": None, "ppa_acumulado": ppa}

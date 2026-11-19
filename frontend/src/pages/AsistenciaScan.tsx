@@ -1,0 +1,326 @@
+// Alumno. Pantalla de escaneo de QR para registrar presente. Depende de: POST /asistencias/qr/verificar.
+import { useEffect, useRef, useState } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import jsQR from 'jsqr'
+import { api, getCurrentUser } from '../lib/api'
+import { PageHead, KpiRow, RefreshButton } from '../components/common/PageKpi'
+
+type Estado = 'idle' | 'verificando' | 'exito' | 'duplicado' | 'expirado' | 'no_autorizado' | 'error'
+type ResultData = { materia_nombre: string; fecha: string; hora_registro: string; presentes: number; ausentes: number }
+type MateriaAsist = { materia_id: number; materia_nombre: string; total_clases: number; presentes: number; porcentaje: number }
+
+const css = `
+  .scan-visor {
+    position:relative; height:300px; border-radius:18px; overflow:hidden;
+    background:radial-gradient(circle at 50% 40%, rgba(0,180,216,0.08), transparent 65%), var(--bg-input);
+    border:1px solid var(--border-subtle);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .scan-visor video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .scan-corner { position:absolute; width:34px; height:34px; border-color:#22d3ee; border-style:solid; border-width:0; }
+  .scan-corner.tl { top:22px; left:22px; border-top-width:3px; border-left-width:3px; border-radius:8px 0 0 0; }
+  .scan-corner.tr { top:22px; right:22px; border-top-width:3px; border-right-width:3px; border-radius:0 8px 0 0; }
+  .scan-corner.bl { bottom:22px; left:22px; border-bottom-width:3px; border-left-width:3px; border-radius:0 0 0 8px; }
+  .scan-corner.br { bottom:22px; right:22px; border-bottom-width:3px; border-right-width:3px; border-radius:0 0 8px 0; }
+  @keyframes scanline { 0%,100%{ transform:translateY(-70px) } 50%{ transform:translateY(70px) } }
+  .scan-line { position:absolute; left:15%; right:15%; height:2px; background:linear-gradient(90deg,transparent,#22d3ee,transparent); animation:scanline 2.4s ease-in-out infinite; }
+  .ring-mat { position:relative; width:46px; height:46px; flex-shrink:0; }
+
+  /* Escáner y materias en dos columnas; en mobile se apilan. */
+  .scan-cols { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 16px; align-items: start; }
+  .scan-tip { margin-top: 14px; font-size: 12px; color: var(--text-secondary); line-height: 1.5; display: flex; gap: 8px; }
+  .scan-mat { display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-radius: 12px; background: var(--bg-surface); border: 1px solid var(--border-subtle); }
+  @media (max-width: 900px) { .scan-cols { grid-template-columns: 1fr; } }
+`
+
+function RingPct({ pct }: { pct: number }) {
+  const r = 19, c = 2 * Math.PI * r
+  const color = pct >= 80 ? 'var(--accent-bright)' : pct >= 60 ? 'var(--warning)' : 'var(--danger)'
+  return (
+    <div className="ring-mat">
+      <svg width="46" height="46" style={{ transform: 'rotate(-90deg)' }}>
+        <circle cx="23" cy="23" r={r} stroke="var(--bg-elevated)" strokeWidth="4" fill="none" />
+        <circle cx="23" cy="23" r={r} stroke={color} strokeWidth="4" fill="none"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct / 100)} strokeLinecap="round" />
+      </svg>
+      <span style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-mono)', fontSize: 9.5, fontWeight: 800 }}>{Math.round(pct)}%</span>
+    </div>
+  )
+}
+
+export default function AsistenciaScan() {
+  const [params] = useSearchParams()
+  const navigate = useNavigate()
+  const token = params.get('token')
+  const [estado, setEstado] = useState<Estado>(token ? 'verificando' : 'idle')
+  const [result, setResult] = useState<ResultData | null>(null)
+  const [errorMsg, setErrorMsg] = useState('')
+  const [materias, setMaterias] = useState<MateriaAsist[]>([])
+  const [camara, setCamara] = useState(false)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const user = getCurrentUser()
+  const nombre = user?.username || 'Alumno'
+
+  const [cargandoMat, setCargandoMat] = useState(false)
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
+  const cargarMaterias = () => {
+    setCargandoMat(true)
+    api.get<MateriaAsist[]>('/alumno/mi-asistencia')
+      .then(d => { setMaterias(d); setLastUpdate(new Date()) })
+      .catch(() => {})
+      .finally(() => setCargandoMat(false))
+  }
+  useEffect(() => { cargarMaterias() }, [])
+
+  useEffect(() => {
+    if (!token) return
+    const currentUser = getCurrentUser()
+    if (!currentUser) {
+      navigate(`/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search)}`)
+      return
+    }
+    const prom = currentUser.role !== 'alumno'
+      ? Promise.reject(new Error('no_autorizado'))
+      : api.post<ResultData>('/asistencias/qr/verificar', { qr_token: token })
+    prom
+      .then(res => { setResult(res); setEstado('exito') })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : ''
+        if (msg.includes('no_autorizado')) setEstado('no_autorizado')
+        else if (msg.includes('ya está registrada')) setEstado('duplicado')
+        else if (msg.includes('expirado') || msg.includes('inválido')) setEstado('expirado')
+        else if (msg.includes('No estás inscripto')) { setEstado('error'); setErrorMsg(msg) }
+        else { setEstado('error'); setErrorMsg(msg || 'Error al conectar con el servidor') }
+      })
+  }, [token, navigate])
+
+  // Cámara + detección QR: BarcodeDetector nativo (Chrome/Edge) → fallback jsQR (Firefox/Safari)
+  async function activarCamara() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+      streamRef.current = stream
+      setCamara(true)
+      setTimeout(async () => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          await videoRef.current.play()
+        }
+        const BD = (window as unknown as {
+          BarcodeDetector?: new (options: { formats: string[] }) => {
+            detect(el: HTMLVideoElement): Promise<Array<{ rawValue: string }>>
+          }
+        }).BarcodeDetector
+        if (BD) {
+          const detector = new BD({ formats: ['qr_code'] })
+          const tick = async () => {
+            if (!streamRef.current || !videoRef.current) return
+            try {
+              const codes = await detector.detect(videoRef.current)
+              if (codes.length > 0) {
+                const raw = codes[0].rawValue as string
+                const m = raw.match(/token=([\w.-]+)/)
+                pararCamara()
+                if (m) { window.location.href = `/asistencia/scan?token=${m[1]}`; return }
+              }
+            } catch { /* frame no listo */ }
+            requestAnimationFrame(tick)
+          }
+          requestAnimationFrame(tick)
+        } else {
+          const canvas = canvasRef.current!
+          const ctx = canvas.getContext('2d')!
+          const tick = () => {
+            if (!streamRef.current || !videoRef.current) return
+            const video = videoRef.current
+            if (video.readyState >= 2) {
+              canvas.width = video.videoWidth
+              canvas.height = video.videoHeight
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+              const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
+              const code = jsQR(imageData.data, imageData.width, imageData.height)
+              if (code) {
+                const m = code.data.match(/token=([\w.-]+)/)
+                pararCamara()
+                if (m) { window.location.href = `/asistencia/scan?token=${m[1]}`; return }
+              }
+            }
+            requestAnimationFrame(tick)
+          }
+          requestAnimationFrame(tick)
+        }
+      }, 50)
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : ''
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setErrorMsg('Permiso de cámara denegado. Hacé clic en el ícono de candado/cámara en la barra de direcciones y permití el acceso, luego recargá la página.')
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        setErrorMsg('No se detectó ninguna cámara en este dispositivo. Probá escanear desde el celular.')
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        setErrorMsg('La cámara está siendo usada por otra aplicación (Zoom, Teams, otra pestaña). Cerrala e intentá de nuevo.')
+      } else if (!window.isSecureContext) {
+        setErrorMsg('El acceso a la cámara requiere HTTPS. Esta página no está en un contexto seguro.')
+      } else {
+        setErrorMsg('No se pudo acceder a la cámara. Verificá los permisos.')
+      }
+    }
+  }
+
+  function pararCamara() {
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+    setCamara(false)
+  }
+  useEffect(() => () => pararCamara(), [])
+
+  /* ── Resultado de scan (llegó con ?token) ── */
+  if (token) {
+    return (
+      <div style={{ minHeight: '60vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+        <div className="card card-elevated" style={{ width: '100%', maxWidth: 380, textAlign: 'center', padding: 30 }}>
+          {estado === 'verificando' && (<>
+            <i className="ti ti-loader-2" style={{ fontSize: 36, color: 'var(--accent-bright)', animation: 'spin 1s linear infinite', display: 'inline-block' }} />
+            <style>{'@keyframes spin{to{transform:rotate(360deg)}}'}</style>
+            <h2 style={{ fontSize: 17, fontWeight: 800, marginTop: 12 }}>Verificando…</h2>
+            <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Registrando tu asistencia</p>
+          </>)}
+          {estado === 'exito' && result && (<>
+            <i className="ti ti-circle-check" style={{ fontSize: 42, color: 'var(--success)' }} />
+            <h2 style={{ fontSize: 18, fontWeight: 800, margin: '10px 0 4px' }}>¡Asistencia registrada!</h2>
+            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 16 }}>Tu presencia quedó confirmada</p>
+            <div style={{ textAlign: 'left', background: 'var(--bg-input)', borderRadius: 12, padding: 14, marginBottom: 16 }}>
+              {[['Materia', result.materia_nombre], ['Fecha', result.fecha], ['Hora', result.hora_registro], ['Alumno', nombre]].map(([l, v]) => (
+                <div key={l} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: 12 }}>
+                  <span className="mono-label">{l}</span><b>{v}</b>
+                </div>
+              ))}
+              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', fontSize: 12 }}>
+                <span className="mono-label">Presentes hoy</span><b>{result.presentes}/{result.presentes + result.ausentes}</b>
+              </div>
+            </div>
+            <button className="btn-primary" style={{ width: '100%' }} onClick={() => navigate('/asistencia')}>Ver mis asistencias</button>
+          </>)}
+          {estado === 'duplicado' && (<>
+            <i className="ti ti-checks" style={{ fontSize: 40, color: 'var(--warning)' }} />
+            <h2 style={{ fontSize: 17, fontWeight: 800, margin: '10px 0 4px' }}>Ya registraste tu asistencia</h2>
+            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 16 }}>Tu presencia ya estaba confirmada.</p>
+            <button className="btn-ghost" style={{ width: '100%' }} onClick={() => navigate('/asistencia')}>Ver mis asistencias</button>
+          </>)}
+          {estado === 'expirado' && (<>
+            <i className="ti ti-clock-x" style={{ fontSize: 40, color: 'var(--text-muted)' }} />
+            <h2 style={{ fontSize: 17, fontWeight: 800, margin: '10px 0 4px' }}>QR expirado</h2>
+            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>Pedile al profesor que genere uno nuevo.</p>
+          </>)}
+          {estado === 'no_autorizado' && (<>
+            <i className="ti ti-lock" style={{ fontSize: 40, color: 'var(--danger)' }} />
+            <h2 style={{ fontSize: 17, fontWeight: 800, margin: '10px 0 4px' }}>Acceso denegado</h2>
+            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>Solo alumnos pueden registrar asistencia con QR.</p>
+          </>)}
+          {estado === 'error' && (<>
+            <i className="ti ti-alert-circle" style={{ fontSize: 40, color: 'var(--danger)' }} />
+            <h2 style={{ fontSize: 17, fontWeight: 800, margin: '10px 0 4px' }}>Algo salió mal</h2>
+            <p style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 16 }}>{errorMsg}</p>
+            <button className="btn-ghost" style={{ width: '100%' }} onClick={() => window.location.reload()}>Reintentar</button>
+          </>)}
+        </div>
+      </div>
+    )
+  }
+
+  /* ── Pantalla scanner (sin token) ──
+     Mobile: todo apilado (comportamiento ya correcto, sin tocar).
+     Desktop (>=1024px): columna del escáner a la izquierda con instrucciones,
+     "Mis Materias" a la derecha — en vez de una sola columna angosta estirada. */
+  const LIMITE = 80 // mismo umbral de riesgo que el panel de asistencia de Cursos
+  const totalClases = materias.reduce((acc, m) => acc + m.total_clases, 0)
+  const totalPresentes = materias.reduce((acc, m) => acc + m.presentes, 0)
+  const promedio = totalClases > 0 ? Math.round((totalPresentes / totalClases) * 100) : null
+  const enRiesgo = materias.filter(m => m.porcentaje < LIMITE)
+  const ciclo = `${String(new Date().getMonth() < 6 ? 1 : 2).padStart(2, '0')}-${new Date().getFullYear()}`
+
+  return (
+    <>
+      <style>{css}</style>
+      <div>
+        <PageHead eyebrow="Asistencia · Escanear QR" title="Registrar asistencia"
+          actions={<RefreshButton onClick={cargarMaterias} refreshing={cargandoMat} lastUpdate={lastUpdate} />} />
+
+        <KpiRow
+          dominant={{
+            label: 'Asistencia promedio',
+            value: promedio ?? '—',
+            unit: promedio === null ? undefined : '%',
+            tone: promedio === null ? 'default' : promedio >= LIMITE ? 'default' : promedio >= 60 ? 'warning' : 'danger',
+            badge: enRiesgo.length > 0 ? (
+              <span className="badge" style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}>
+                <i className="ti ti-alert-triangle" /> {enRiesgo.length} en riesgo
+              </span>
+            ) : undefined,
+            foot: [
+              { label: 'Ciclo', value: ciclo },
+              { label: 'Clases presentes', value: `${totalPresentes}/${totalClases}` },
+            ],
+          }}
+          secondary={[
+            { label: 'Materias', value: String(materias.length).padStart(2, '0'), sub: 'con registro de asistencia' },
+            { label: 'Alertas', value: enRiesgo.length, alert: enRiesgo.length > 0, tone: enRiesgo.length > 0 ? 'danger' : 'success',
+              sub: enRiesgo.length > 0 ? enRiesgo.map(m => `${m.materia_nombre} · riesgo`).join(', ') : `Todas sobre el ${LIMITE}%` },
+          ]}
+        />
+
+        <div className="scan-cols">
+          <div className="card" style={{ padding: 20 }}>
+            <div className="mono-label" style={{ marginBottom: 14 }}>Cámara del dispositivo</div>
+            <div className="scan-visor">
+              {camara && <video ref={videoRef} muted playsInline />}
+              <canvas ref={canvasRef} style={{ display: 'none' }} />
+              <span className="scan-corner tl" /><span className="scan-corner tr" />
+              <span className="scan-corner bl" /><span className="scan-corner br" />
+              {camara ? <span className="scan-line" /> : (
+                <i className="ti ti-qrcode" style={{ fontSize: 40, color: 'var(--text-muted)', opacity: 0.7 }} />
+              )}
+            </div>
+
+            {errorMsg && <p style={{ fontSize: 12, color: 'var(--warning)', marginTop: 10 }}>{errorMsg}</p>}
+
+            <button className="btn-primary" style={{ width: '100%', marginTop: 14, padding: 12, fontSize: 13.5, justifyContent: 'center' }}
+              onClick={camara ? pararCamara : activarCamara}>
+              <i className={`ti ${camara ? 'ti-camera-off' : 'ti-camera'}`} /> {camara ? 'Detener Cámara' : 'Activar Cámara'}
+            </button>
+
+            <div className="scan-tip">
+              <i className="ti ti-info-circle" style={{ color: 'var(--text-muted)', marginTop: 2 }} />
+              <span>Apuntá la cámara hacia el código QR que proyecta tu profesor. También podés escanearlo con la cámara del celular.</span>
+            </div>
+          </div>
+
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <span className="mono-label">Mis materias</span>
+              <span className="mono-label">{String(materias.length).padStart(2, '0')}</span>
+            </div>
+
+            {materias.length === 0 ? (
+              <div className="card" style={{ textAlign: 'center', color: 'var(--text-secondary)', fontSize: 13 }}>Sin registros de asistencia aún.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {materias.map(mt => (
+                  <div key={mt.materia_id} className="scan-mat">
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, fontWeight: 800 }}>{mt.materia_nombre}</div>
+                      <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 3 }}>
+                        {mt.presentes}/{mt.total_clases} clases presentes
+                      </div>
+                    </div>
+                    <RingPct pct={mt.porcentaje} />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}

@@ -1,0 +1,61 @@
+# Framework principal
+fastapi
+uvicorn[standard]
+
+# Base de datos y ORM
+sqlalchemy
+alembic
+psycopg2-binary
+
+# Autenticación y seguridad
+python-jose[cryptography]
+passlib[bcrypt]
+# FIX AUDITORIA_2026-07-24 #1: pin obligatorio. passlib 1.7.4 (sin mantenimiento)
+# rompe con bcrypt>=4.1 (ValueError en TODO hash/verify). Ver CHANGELOG_FIXES.md.
+bcrypt==4.0.1
+python-dotenv
+
+# Rate limiting global (redis opcional, fallback a memoria local)
+redis>=5.0
+
+# Manejo de PDFs
+pymupdf
+pdfplumber
+
+# Gemini API
+google-genai
+
+# Generación de PDFs y QR
+reportlab
+weasyprint
+qrcode[pil]
+Pillow
+
+# Email y notificaciones
+fastapi-mail
+aiofiles
+email-validator
+pywebpush
+
+# Storage (Cloudflare R2 / S3-compatible)
+boto3>=1.34
+
+# Stripe — pagos online
+stripe>=15.0
+
+# Financiero — fechas y exportación
+python-dateutil
+openpyxl
+
+# Push notifications
+pywebpush
+
+# Pago online
+stripe
+
+# Pruebas
+pytest
+pytest-asyncio
+pytest-mock
+httpx
+python-multipart

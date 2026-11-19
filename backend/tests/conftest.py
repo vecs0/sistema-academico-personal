@@ -1,0 +1,208 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env.test")
+
+import os  # noqa: E402
+
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
+os.environ.setdefault("CSRF_ENABLED", "false")
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+from app.main import app  # noqa: E402
+from app.database import Base, get_db  # noqa: E402
+
+# Import all models so every table is registered in Base.metadata
+from app.models import (  # noqa: F401, E402
+    user as user_model,
+    materia as materia_model,
+    oferta_materia as oferta_materia_model,
+    inscripcion,
+    carrera as carrera_model,
+    asistencia,
+    puntaje as puntaje_model,
+    apunte,
+    evento_calendario,
+    horario,
+    financiero,  # noqa: F401 — registra todas las tablas financieras en Base.metadata
+    tramites,  # noqa: F401 — registra tipos_tramite/solicitudes en Base.metadata
+    pasantia,  # noqa: F401 — Fase 5C: pasantías
+    graduacion,  # noqa: F401 — Fase 5B: graduación
+    equivalencia,  # noqa: F401 — Fase 5D: equivalencias
+)
+from app.security import hash_password  # noqa: E402
+from app.auth import create_access_token  # noqa: E402
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+engine_test = create_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine_test)
+
+
+@pytest.fixture()
+def db():
+    Base.metadata.create_all(bind=engine_test)
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine_test)
+
+
+@pytest.fixture()
+def client(db):
+    def override_get_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    # FIX AUDITORIA_2026-07-24 #7: also point blacklist checks to the test
+    # DB. get_current_user() always
+    # calls db.close() on whatever get_blacklist_db() returns (mirrors the
+    # real dedicated SessionLocal() in production) — returning the shared
+    # `db` fixture session directly would close/detach it on every
+    # authenticated request. Wrap it so close() is a no-op instead.
+    from app import dependencias as deps
+
+    class _NonClosingSessionProxy:
+        def __init__(self, session):
+            self._session = session
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def close(self):
+            pass
+
+    _blacklist_proxy = _NonClosingSessionProxy(db)
+
+    def override_blacklist_db():
+        return _blacklist_proxy
+
+    deps.get_blacklist_db = override_blacklist_db
+
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def seed(db):
+    carrera = carrera_model.Carrera(nombre="Ing. Inform\u00e1tica")
+    db.add(carrera)
+    db.flush()
+
+    admin = user_model.User(
+        username="admin_test",
+        hashed_password=hash_password("admin123"),
+        role="admin",
+        nombre="Admin Test",
+        email="admin@test.com",
+    )
+    profesor = user_model.User(
+        username="prof_test",
+        hashed_password=hash_password("prof123"),
+        role="profesor",
+        nombre="Profesor Test",
+        email="prof@test.com",
+    )
+    db.add_all([admin, profesor])
+    db.flush()
+
+    alumno = user_model.User(
+        username="alumno_test",
+        hashed_password=hash_password("alumno123"),
+        role="alumno",
+        nombre="Alumno Test",
+        email="alumno@test.com",
+        carrera_id=carrera.id,
+    )
+    db.add(alumno)
+    db.flush()
+
+    alumno2 = user_model.User(
+        username="alumno2_test",
+        hashed_password=hash_password("alumno123"),
+        role="alumno",
+        nombre="Alumno Dos Test",
+        email="alumno2@test.com",
+        carrera_id=carrera.id,
+    )
+    db.add(alumno2)
+    db.flush()
+
+    materia = materia_model.Materia(
+        nombre="Programaci\u00f3n I",
+        carrera_id=carrera.id,
+        anio=1,
+        semestre=1,
+    )
+    db.add(materia)
+    db.flush()
+
+    oferta = oferta_materia_model.OfertaMateria(
+        materia_id=materia.id,
+        profesor_id=profesor.id,
+        periodo="2026-1",
+        activa=True,
+    )
+    db.add(oferta)
+    db.commit()
+
+    for obj in (admin, profesor, alumno, alumno2, carrera, materia, oferta):
+        db.refresh(obj)
+
+    return {
+        "admin": admin,
+        "profesor": profesor,
+        "alumno": alumno,
+        "alumno2": alumno2,
+        "carrera": carrera,
+        "materia": materia,
+        "oferta": oferta,
+    }
+
+
+@pytest.fixture()
+def tokens(seed):
+    return {
+        "admin": create_access_token(
+            {
+                "sub": seed["admin"].username,
+                "role": "admin",
+                "user_id": seed["admin"].id,
+            }
+        ),
+        "profesor": create_access_token(
+            {
+                "sub": seed["profesor"].username,
+                "role": "profesor",
+                "user_id": seed["profesor"].id,
+            }
+        ),
+        "alumno": create_access_token(
+            {
+                "sub": seed["alumno"].username,
+                "role": "alumno",
+                "user_id": seed["alumno"].id,
+            }
+        ),
+        "alumno2": create_access_token(
+            {
+                "sub": seed["alumno2"].username,
+                "role": "alumno",
+                "user_id": seed["alumno2"].id,
+            }
+        ),
+    }

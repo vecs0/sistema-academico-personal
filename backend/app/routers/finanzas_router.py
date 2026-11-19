@@ -1,0 +1,571 @@
+"""
+Router Finanzas — Fase 4 + 4B.
+
+Endpoints:
+  POST /finanzas/conceptos
+  POST /finanzas/cuotas/generar
+  GET  /finanzas/alumno/{id}/cuotas
+  POST /finanzas/pagos
+  GET  /finanzas/pagos/{id}/comprobante
+  POST /finanzas/pagos/{id}/comprobante/reintentar
+  GET  /finanzas/comprobantes/pendientes
+  GET  /finanzas/alumno/{id}/estado-deuda-inscripcion
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from uuid import uuid4
+
+import stripe
+
+from app import database
+from app.dependencias import get_current_user, require_role
+from app.models.financiero import (
+    ConceptoArancel,
+    Cuota,
+    Pago,
+    Comprobante,
+    PagoOnline,
+    BecaActiva,
+)
+from app.schemas.financiero import (
+    ConceptoArancelCreate,
+    ConceptoArancelUpdate,
+    ConceptoArancelOut,
+    GenerarCuotasRequest,
+    CuotaOut,
+    PagoCreate,
+    PagoOut,
+    ComprobanteOut,
+    ComprobantePendienteOut,
+    EstadoDeudaOut,
+    PagoOnlineInitRequest,
+    PagoOnlineInitResponse,
+    PagoOnlineConfirmRequest,
+    PagoOnlineOut,
+    FinanzasResumenOut,
+)
+from app.services.financiero import (
+    generar_cuotas_alumno,
+    cuota_to_out,
+    registrar_pago,
+    verificar_deuda_inscripcion,
+)
+from app.services.facturacion_electronica import procesar_facturacion, MAX_INTENTOS
+from app.services.pagos_online import init_stripe, crear_checkout_session, confirmar_pago_webhook
+
+logger = logging.getLogger(__name__)
+
+init_stripe()
+
+router = APIRouter(prefix="/finanzas", tags=["finanzas"])
+
+
+# ── Conceptos arancel ─────────────────────────────────────────────────
+
+
+@router.post(
+    "/conceptos",
+    response_model=ConceptoArancelOut,
+    summary="Crear concepto de arancel",
+)
+def crear_concepto(
+    data: ConceptoArancelCreate,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    concepto = ConceptoArancel(
+        nombre=data.nombre,
+        carrera_id=data.carrera_id,
+        monto_base=data.monto_base,
+        periodicidad=data.periodicidad,
+    )
+    db.add(concepto)
+    db.commit()
+    db.refresh(concepto)
+    return concepto
+
+
+@router.get(
+    "/conceptos",
+    response_model=List[ConceptoArancelOut],
+    summary="Listar conceptos de arancel",
+)
+def listar_conceptos(
+    carrera_id: Optional[int] = None,
+    incluir_inactivos: bool = False,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role(["admin"])),
+):
+    q = db.query(ConceptoArancel)
+    if not incluir_inactivos:
+        q = q.filter(ConceptoArancel.activo == True)  # noqa: E712
+    if carrera_id:
+        q = q.filter(
+            (ConceptoArancel.carrera_id == carrera_id)
+            | (ConceptoArancel.carrera_id == None)  # noqa: E711
+        )
+    return q.order_by(ConceptoArancel.nombre).all()
+
+
+@router.patch(
+    "/conceptos/{concepto_id}",
+    response_model=ConceptoArancelOut,
+    summary="Editar o activar/desactivar un concepto de arancel",
+)
+def actualizar_concepto(
+    concepto_id: int,
+    data: ConceptoArancelUpdate,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    concepto = db.query(ConceptoArancel).filter(ConceptoArancel.id == concepto_id).first()
+    if not concepto:
+        raise HTTPException(status_code=404, detail="Concepto no encontrado")
+    for key, value in data.model_dump(exclude_unset=True).items():
+        setattr(concepto, key, value)
+    db.commit()
+    db.refresh(concepto)
+    return concepto
+
+
+# ── Generación de cuotas ──────────────────────────────────────────────
+
+
+@router.post(
+    "/cuotas/generar",
+    response_model=List[CuotaOut],
+    summary="Generar cuotas para un alumno",
+)
+def generar_cuotas(
+    data: GenerarCuotasRequest,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    try:
+        with db.begin_nested():
+            cuotas = generar_cuotas_alumno(
+                alumno_id=data.alumno_id,
+                concepto_id=data.concepto_id,
+                periodos=data.periodos,
+                fecha_vencimiento_base=data.fecha_vencimiento_base,
+                generado_por=current_user.user_id,
+                db=db,
+            )
+        db.commit()
+        for c in cuotas:
+            db.refresh(c)
+        return [cuota_to_out(c) for c in cuotas]
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+# ── Cuotas por alumno ─────────────────────────────────────────────────
+
+
+@router.get(
+    "/alumno/{alumno_id}/cuotas",
+    response_model=List[CuotaOut],
+    summary="Cuotas de un alumno",
+)
+def cuotas_alumno(
+    alumno_id: int,
+    estado: Optional[str] = None,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    if current_user.role != "admin" and current_user.user_id != alumno_id:
+        raise HTTPException(status_code=403, detail="No autorizado")
+    query = db.query(Cuota).filter(Cuota.alumno_id == alumno_id)
+    if estado:
+        query = query.filter(Cuota.estado == estado)
+    cuotas = query.order_by(Cuota.fecha_vencimiento.desc()).all()
+    return [cuota_to_out(c) for c in cuotas]
+
+
+# ── Pagos ─────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/pagos",
+    response_model=PagoOut,
+    summary="Registrar un pago (inmutable)",
+)
+def crear_pago(
+    data: PagoCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role(["admin"])),
+):
+    """
+    Pagos INMUTABLES. No existe endpoint PUT/DELETE.
+    Para correcciones usar pago_ajuste_ref_id con nota_ajuste.
+
+    Al registrar el pago se crea un Comprobante en estado 'pendiente' y
+    se dispara la emisión fiscal en background (guarani.app) — un fallo
+    del proveedor externo nunca bloquea ni revierte el pago académico.
+    """
+    try:
+        with db.begin_nested():
+            pago = registrar_pago(
+                cuota_id=data.cuota_id,
+                monto_pagado=data.monto_pagado,
+                metodo=data.metodo,
+                registrado_por=current_user.user_id,
+                db=db,
+                referencia=data.referencia,
+                pago_ajuste_ref_id=data.pago_ajuste_ref_id,
+                nota_ajuste=data.nota_ajuste,
+            )
+        db.commit()
+        db.refresh(pago)
+
+        comprobante = Comprobante(
+            pago_id=pago.id, tipo="factura", estado_emision="pendiente"
+        )
+        db.add(comprobante)
+        db.commit()
+        db.refresh(comprobante)
+
+        import asyncio
+        background_tasks.add_task(lambda: asyncio.create_task(procesar_facturacion(pago.id, comprobante.id)))  # type: ignore[arg-type]
+
+        return pago
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get(
+    "/pagos/{pago_id}/comprobante",
+    response_model=ComprobanteOut,
+    summary="Obtener comprobante de pago",
+)
+def get_comprobante(
+    pago_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(get_current_user),
+):
+    pago = db.query(Pago).filter(Pago.id == pago_id).first()
+    if not pago:
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
+
+    # Alumno solo puede ver comprobantes de sus propias cuotas; otros roles requieren admin
+    if current_user.role == "alumno":
+        cuota = db.query(Cuota).filter(Cuota.id == pago.cuota_id).first()
+        if not cuota or cuota.alumno_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="No autorizado")
+    elif current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    comp = db.query(Comprobante).filter(Comprobante.pago_id == pago_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Comprobante no encontrado")
+    return comp
+
+
+@router.post(
+    "/pagos/{pago_id}/comprobante/reintentar",
+    response_model=ComprobanteOut,
+    summary="Forzar reintento manual de emisión de comprobante (admin)",
+)
+async def reintentar_comprobante(
+    pago_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role(["admin"])),
+):
+    comp = db.query(Comprobante).filter(Comprobante.pago_id == pago_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Comprobante no encontrado")
+    if comp.intentos >= MAX_INTENTOS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Comprobante alcanzó el máximo de {MAX_INTENTOS} intentos",
+        )
+
+    await procesar_facturacion(pago_id, comp.id)  # type: ignore[arg-type]
+    db.refresh(comp)
+    return comp
+
+
+@router.get(
+    "/comprobantes/pendientes",
+    response_model=List[ComprobantePendienteOut],
+    summary="Listar comprobantes pendientes o en error (admin)",
+)
+def listar_comprobantes_pendientes(
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role(["admin"])),
+):
+    comps = (
+        db.query(Comprobante)
+        .filter(Comprobante.estado_emision.in_(["pendiente", "error", "reintentando"]))
+        .all()
+    )
+    out = []
+    for c in comps:
+        pago = c.pago
+        alumno = pago.cuota.alumno if pago and pago.cuota else None
+        out.append(
+            ComprobantePendienteOut(
+                id=c.id,  # type: ignore[arg-type]
+                pago_id=c.pago_id,  # type: ignore[arg-type]
+                alumno_nombre=alumno.nombre if alumno else "—",
+                monto_pagado=pago.monto_pagado if pago else Decimal("0"),
+                estado_emision=c.estado_emision,  # type: ignore[arg-type]
+                intentos=c.intentos,  # type: ignore[arg-type]
+                ultimo_error=c.ultimo_error,  # type: ignore[arg-type]
+            )
+        )
+    return out
+
+
+# ── Estado deuda para inscripción (endpoint interno) ──────────────────
+
+
+@router.get(
+    "/alumno/{alumno_id}/estado-deuda-inscripcion",
+    response_model=EstadoDeudaOut,
+    summary="Verificar estado de deuda para inscripción (uso interno)",
+)
+def estado_deuda_inscripcion(
+    alumno_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    return verificar_deuda_inscripcion(
+        alumno_id=alumno_id,
+        db=db,
+        es_admin=True,
+    )
+
+
+# ── Pagos online (Stripe Checkout) ──────────────────────────────────
+
+
+@router.post(
+    "/pagos/init",
+    response_model=PagoOnlineInitResponse,
+    summary="Iniciar pago online con Stripe Checkout",
+)
+def pago_online_init(
+    body: PagoOnlineInitRequest,
+    request: Request,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("alumno")),
+):
+    cuota = db.query(Cuota).filter(Cuota.id == body.cuota_id).first()
+    if not cuota:
+        raise HTTPException(404, "Cuota no encontrada")
+    if cuota.alumno_id != current_user.user_id:
+        raise HTTPException(403, "Esta cuota no te pertenece")
+    if cuota.estado == "pagada":
+        raise HTTPException(400, "La cuota ya está pagada")
+
+    origen = str(request.base_url).rstrip("/")
+    success_url = body.success_url or f"{origen}/finanzas/pagos/success"
+    cancel_url = body.cancel_url or f"{origen}/finanzas/pagos/cancel"
+
+    monto_a_pagar = cuota.monto - cuota.monto_descuento
+
+    transaction_id = str(uuid4())
+    pago = PagoOnline(
+        cuota_id=cuota.id,
+        alumno_id=current_user.user_id,
+        monto=monto_a_pagar,
+        transaction_id=transaction_id,
+        estado="pendiente",
+    )
+    db.add(pago)
+    db.commit()
+    db.refresh(pago)
+
+    try:
+        session = crear_checkout_session(
+            cuota_id=cuota.id,
+            monto=monto_a_pagar,
+            alumno_email=current_user.username,
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "pago_online_id": str(pago.id),
+                "transaction_id": transaction_id,
+            },
+        )
+    except stripe.error.StripeError as e:
+        pago.estado = "error"
+        pago.gateway_response = {"error": str(e)}
+        db.commit()
+        raise HTTPException(502, f"Error al comunicar con Stripe: {e}")
+    except RuntimeError as e:
+        pago.estado = "error"
+        pago.gateway_response = {"error": str(e)}
+        db.commit()
+        raise HTTPException(503, f"Stripe no disponible: {e}")
+
+    pago.stripe_session_id = session.id
+    pago.gateway_url = session.url
+    db.commit()
+
+    return PagoOnlineInitResponse(
+        pago_id=pago.id,  # type: ignore[arg-type]
+        transaction_id=pago.transaction_id,  # type: ignore[arg-type]
+        redirect_url=pago.gateway_url,  # type: ignore[arg-type]
+        monto=pago.monto,  # type: ignore[arg-type]
+        stripe_session_id=pago.stripe_session_id,  # type: ignore[arg-type]
+    )
+
+
+@router.post(
+    "/pagos/webhook",
+    summary="Webhook de Stripe — checkout.session.completed",
+)
+async def pago_online_webhook(
+    request: Request,
+    db: Session = Depends(database.get_db),
+):
+    payload = await request.body()
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = confirmar_pago_webhook(payload, sig_header)
+    except (ValueError, stripe.error.SignatureVerificationError) as e:
+        logger.error("Webhook inválido: %s", e)
+        raise HTTPException(400, "Webhook inválido")
+    except Exception as e:
+        logger.error("Error al procesar webhook: %s", e)
+        raise HTTPException(400, "Error al procesar webhook")
+
+    if event.type == "checkout.session.completed":
+        session = event.data.object
+        transaction_id = session.get("metadata", {}).get("transaction_id")
+        if not transaction_id:
+            logger.warning("Webhook sin transaction_id en metadata")
+            return {"status": "ignored"}
+
+        pago = db.query(PagoOnline).filter(
+            PagoOnline.transaction_id == transaction_id
+        ).first()
+        if not pago:
+            logger.warning("Transacción %s no encontrada en webhook", transaction_id)
+            return {"status": "not_found"}
+
+        if pago.estado != "pendiente":
+            logger.info("Pago %s ya procesado (estado=%s)", pago.id, pago.estado)
+            return {"status": "already_processed"}
+
+        pago.estado = "confirmado"
+        pago.confirmado_en = datetime.now(timezone.utc)
+        pago.gateway_response = json.loads(session.to_json()) if hasattr(session, "to_json") else {"session_id": session.get("id")}
+
+        cuota = db.query(Cuota).filter(Cuota.id == pago.cuota_id).first()
+        if cuota:
+            cuota.estado = "pagada"
+
+        db.commit()
+        logger.info("Pago online %s confirmado vía webhook", pago.id)
+        return {"status": "ok"}
+
+    return {"status": "unhandled_event_type", "type": event.type}
+
+
+@router.post(
+    "/pagos/confirm",
+    summary="Confirmar pago manualmente (solo pruebas, usar webhook en producción)",
+)
+def pago_online_confirm(
+    body: PagoOnlineConfirmRequest,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    pago = db.query(PagoOnline).filter(
+        PagoOnline.transaction_id == body.transaction_id
+    ).first()
+    if not pago:
+        raise HTTPException(404, "Transacción no encontrada")
+    if pago.estado != "pendiente":
+        raise HTTPException(400, "Transacción ya procesada")
+
+    if body.estado == "confirmado":
+        pago.estado = "confirmado"
+        pago.confirmado_en = datetime.now(timezone.utc)
+        pago.gateway_response = {"status": "confirmado", "timestamp": str(pago.confirmado_en)}
+
+        cuota = db.query(Cuota).filter(Cuota.id == pago.cuota_id).first()
+        if cuota:
+            cuota.estado = "pagada"
+    else:
+        pago.estado = "rechazado"
+        pago.gateway_response = {"status": "rechazado"}
+
+    db.commit()
+    return {"mensaje": f"Pago {body.estado}", "transaction_id": pago.transaction_id}
+
+
+@router.get(
+    "/pagos/online/{pago_id}",
+    response_model=PagoOnlineOut,
+    summary="Estado de un pago online",
+)
+def pago_online_status(
+    pago_id: int,
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("alumno")),
+):
+    pago = db.query(PagoOnline).filter(PagoOnline.id == pago_id).first()
+    if not pago:
+        raise HTTPException(404, "Pago no encontrado")
+    if pago.alumno_id != current_user.user_id:
+        raise HTTPException(403, "Acceso denegado")
+    return pago
+
+
+# ── Resumen / KPIs ───────────────────────────────────────────────────
+
+
+@router.get(
+    "/resumen",
+    response_model=FinanzasResumenOut,
+    summary="KPIs del panel financiero (admin)",
+)
+def resumen_finanzas(
+    db: Session = Depends(database.get_db),
+    current_user=Depends(require_role("admin")),
+):
+    total_recaudado = (
+        db.query(func.sum(Pago.monto_pagado)).filter(Pago.es_ajuste == False).scalar()  # noqa: E712
+        or Decimal("0")
+    )
+    cuotas_pendientes = (
+        db.query(func.count(Cuota.id)).filter(Cuota.estado == "pendiente").scalar() or 0
+    )
+    cuotas_vencidas = (
+        db.query(func.count(Cuota.id)).filter(Cuota.estado == "vencida").scalar() or 0
+    )
+    becas_activas = (
+        db.query(func.count(BecaActiva.id))
+        .filter(BecaActiva.estado_renovacion == "vigente")
+        .scalar()
+        or 0
+    )
+    comprobantes_pendientes = (
+        db.query(func.count(Comprobante.id))
+        .filter(Comprobante.estado_emision.in_(["pendiente", "error", "reintentando"]))
+        .scalar()
+        or 0
+    )
+
+    return FinanzasResumenOut(
+        total_recaudado=total_recaudado,
+        cuotas_pendientes=cuotas_pendientes,
+        cuotas_vencidas=cuotas_vencidas,
+        becas_activas=becas_activas,
+        comprobantes_pendientes=comprobantes_pendientes,
+    )

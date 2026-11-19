@@ -1,0 +1,64 @@
+# backend/app/routers/__init__.py
+from . import users_router as users
+from . import auth_router as auth
+from . import test
+from . import materia_router as materias
+from . import inscripciones_router as inscripciones
+from . import carreras_router as carreras
+from . import asistencias_router as asistencias
+from . import puntajes_router as puntajes
+from . import apuntes_router as apuntes
+from . import eventos_router as eventos
+from . import programas_router as programas
+from . import reportes_router as reportes
+from . import boleta_router as boleta
+from . import alumno_router as alumno
+from . import reporte_notas_router as reporte_notas
+from . import horarios_router as horarios
+from . import profesor_router as profesor
+from . import pensum_router as pensum
+from . import expediente_router as expediente
+from . import finanzas_router as finanzas
+from . import becas_router as becas
+from . import tramites_router as tramites
+from . import pasantias_router as pasantias
+from . import graduacion_router as graduacion
+from . import equivalencias_router as equivalencias
+from . import examenes_router as examenes
+from . import notificaciones_router as notificaciones
+from . import notas_router as notas
+from . import admin_router as admin
+from . import settings_router as settings
+
+__all__ = [
+    "users",
+    "auth",
+    "materias",
+    "inscripciones",
+    "carreras",
+    "asistencias",
+    "puntajes",
+    "apuntes",
+    "eventos",
+    "programas",
+    "reportes",
+    "boleta",
+    "alumno",
+    "reporte_notas",
+    "horarios",
+    "profesor",
+    "pensum",
+    "expediente",
+    "finanzas",
+    "becas",
+    "tramites",
+    "pasantias",
+    "graduacion",
+    "equivalencias",
+    "examenes",
+    "notificaciones",
+    "notas",
+    "admin",
+    "settings",
+    "test",
+]

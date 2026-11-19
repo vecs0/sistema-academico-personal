@@ -1,0 +1,1152 @@
+// Público. Login (JWT + SecureStore + biometric opcional). Depende de: services/authService.ts.
+import { colors } from "../../constants/design";
+import React, { useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Dimensions,
+  FlatList,
+  Image,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import Animated, {
+  FadeIn,
+  FadeOut,
+  Easing,
+  Layout,
+  ZoomIn,
+} from "react-native-reanimated";
+import { LinearGradient } from "expo-linear-gradient";
+import Svg, { Path, Rect, Circle } from "react-native-svg";
+import * as LocalAuthentication from "expo-local-authentication";
+import * as SecureStore from "expo-secure-store";
+import { AxiosError } from "axios";
+import { CurveBackground } from "../../components/CurveBackground";
+import { useAuth } from "../../hooks/useAuth";
+import { loginRequest, recuperarContrasenaRequest, registroRequest, resetPasswordRequest } from "../../services/authService";
+import { warmUpBackend } from "../../services/api";
+import { fetchPerfil } from "../../services/dashboardService";
+import { fontFamily, spacing } from "../../constants/design";
+import SelectField, { SelectOption } from "../../components/ui/SelectField";
+
+// ---------------------------------------------------------------------------
+// Paleta v4 — blanco/celeste arriba, azul marino abajo.
+// ---------------------------------------------------------------------------
+const P = {
+  navy: "#0d2137",
+  navyMuted: "#16283c",
+  headerLight: "#f4fafd",
+  headerTitle: "#0d2137",
+  heroAccent: "#2a86bd",
+  tabTrack: "rgba(13,33,55,0.08)",
+  tabTrackBorder: "rgba(13,33,55,0.14)",
+  tabPill: "#06b6d4",
+  tabInactive: "#2a5470",
+  inputBg: "rgba(255,255,255,0.06)",
+  inputBorder: "rgba(255,255,255,0.28)",
+  inputBorderAccent: "rgba(56,189,248,0.5)",
+  inputLabel: "#7fa6c4",
+  placeholder: "#5f7488",
+  white: "#ffffff",
+  accent: "#38bdf8",
+  accentMid: "#1479b8",
+  gradA: "#06b6d4",
+  gradB: "#0ea5e9",
+  tileBg: "#16283c",
+  tileBorder: "rgba(255,255,255,0.06)",
+  tileIcon: "#2a9fd8",
+  tileLabel: "#e8f3fa",
+  mutedText: "#a9c4d8",
+  bodyMuted: "#2a5470",
+  error: "#fca5a5",
+};
+
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
+const HEADER_H = Math.round(SCREEN_H * 0.38);
+const SAVED_CREDENTIALS_KEY = "uca.saved_credentials";
+const SECRETARIA_EMAIL = "secretaria@uca.edu.py";
+
+function WaveBackground({
+  title,
+  heroHeight = HEADER_H,
+  children,
+}: {
+  title: string;
+  heroHeight?: number;
+  children: React.ReactNode;
+}) {
+  const insets = useSafeAreaInsets();
+  return (
+    <View style={{ flex: 1, backgroundColor: P.navy }}>
+      <View
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          height: heroHeight,
+          backgroundColor: P.headerLight,
+          overflow: "hidden",
+          alignItems: "center",
+          justifyContent: "center",
+          paddingTop: insets.top,
+          paddingBottom: 80,
+        }}
+      >
+        <Image
+          source={require("../../assets/logo_sistema.png")}
+          style={{ width: 72, height: 72, resizeMode: "contain", marginBottom: 8 }}
+        />
+        <Text
+          style={{
+            fontFamily: fontFamily.interBold,
+            fontSize: 30,
+            color: P.headerTitle,
+            letterSpacing: -0.5,
+            lineHeight: 34,
+            textAlign: "center",
+          }}
+        >
+          {title}
+        </Text>
+        <CurveBackground width={SCREEN_W} fill={P.navy} />
+      </View>
+      {children}
+    </View>
+  );
+}
+
+function CapIcon({ fill = P.accent, size = 40 }: { fill?: string; size?: number }) {
+  return (
+    <Svg width={size} height={Math.round(size * 0.857)} viewBox="0 0 56 48" fill="none">
+      <Path d="M28 4L2 16L28 28L54 16L28 4Z" fill={fill} />
+      <Path d="M10 22V34C10 34 16 40 28 40C40 40 46 34 46 34V22L28 30L10 22Z" fill={fill} opacity={0.8} />
+      <Rect x="50" y="16" width="4" height="13" rx="2" fill={fill} />
+      <Circle cx="52" cy="30" r="3" fill={fill} />
+    </Svg>
+  );
+}
+
+function BackArrowIcon({ color = P.headerTitle }: { color?: string }) {
+  return (
+    <Svg width={24} height={24} viewBox="0 0 24 24" fill="none">
+      <Path d="M19 12H5M12 19l-7-7 7-7" stroke={color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+type Tab = "login" | "register";
+type Screen = "main" | "forgot" | "reset";
+type BioType = "Face ID" | "Huella digital" | "Biométrico";
+
+const TITLE = "PORTAL ACADÉMICO";
+
+const DOC_TYPES: SelectOption[] = [
+  { label: 'Libreta de Baja', value: 'LIBRETA_BAJA', icon: 'book-outline' },
+  { label: 'Libreta Cívica', value: 'LIBRETA_CIVICA', icon: 'book-outline' },
+  { label: 'Pasaporte', value: 'PASAPORTE', icon: 'passport' },
+  { label: 'Carnet de Migraciones', value: 'MIGRACIONES', icon: 'briefcase-outline' },
+  { label: 'RUC', value: 'RUC', icon: 'file-account-outline' },
+  { label: 'Indefinido', value: 'INDEFINIDO', icon: 'help-circle-outline' },
+  { label: 'DNI', value: 'DNI', icon: 'card-account-details-outline' },
+  { label: 'RG - Registro General', value: 'RG', icon: 'card-account-details-outline' },
+  { label: 'Cédula de Identidad', value: 'CI', icon: 'card-account-details-outline' },
+  { label: 'RUT', value: 'RUT', icon: 'file-account-outline' },
+];
+
+const COUNTRIES: SelectOption[] = [
+  { label: 'Paraguay', value: 'PY', subtitle: '🇵🇾 PY' },
+  { label: 'Argentina', value: 'AR', subtitle: '🇦🇷 AR' },
+  { label: 'Brasil', value: 'BR', subtitle: '🇧🇷 BR' },
+  { label: 'Bolivia', value: 'BO', subtitle: '🇧🇴 BO' },
+  { label: 'Chile', value: 'CL', subtitle: '🇨🇱 CL' },
+  { label: 'Uruguay', value: 'UY', subtitle: '🇺🇾 UY' },
+  { label: 'Perú', value: 'PE', subtitle: '🇵🇪 PE' },
+  { label: 'Colombia', value: 'CO', subtitle: '🇨🇴 CO' },
+  { label: 'Venezuela', value: 'VE', subtitle: '🇻🇪 VE' },
+  { label: 'España', value: 'ES', subtitle: '🇪🇸 ES' },
+  { label: 'Estados Unidos', value: 'US', subtitle: '🇺🇸 US' },
+  { label: 'México', value: 'MX', subtitle: '🇲🇽 MX' },
+  { label: 'Otro', value: 'OTRO', subtitle: '🌐 OTRO' },
+];
+
+export default function LoginScreen() {
+  const { setTokens, confirmAuth } = useAuth();
+  const insets = useSafeAreaInsets();
+
+  const [screen, setScreen] = useState<Screen>("main");
+  const [tab, setTab] = useState<Tab>("login");
+
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+
+  const [regDoc, setRegDoc] = useState("");
+  const [regMatricula, setRegMatricula] = useState("");
+
+  const [foreignOpen, setForeignOpen] = useState(false);
+  const [foreignDocType, setForeignDocType] = useState("");
+  const [foreignCountry, setForeignCountry] = useState("");
+  const [foreignCountryText, setForeignCountryText] = useState("");
+
+  const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [bioType, setBioType] = useState<BioType>("Biométrico");
+  const [loginSuccess, setLoginSuccess] = useState(false);
+  const [welcomeName, setWelcomeName] = useState("");
+  const [welcomeCarrera, setWelcomeCarrera] = useState<string | null>(null);
+
+  const [fpDoc, setFpDoc] = useState("");
+  const [fpSending, setFpSending] = useState(false);
+
+  const [rpToken, setRpToken] = useState("");
+  const [rpPass, setRpPass] = useState("");
+  const [rpConfirm, setRpConfirm] = useState("");
+  const [rpSending, setRpSending] = useState(false);
+  const [rpDone, setRpDone] = useState(false);
+  const rpPassRef = useRef<TextInput>(null);
+  const rpConfirmRef = useRef<TextInput>(null);
+
+  // Collapsa el header cuando el teclado está abierto para que los campos
+  // (Documento / Contraseña) queden siempre visibles sobre el teclado.
+  const [kbOpen, setKbOpen] = useState(false);
+
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const welcomeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const passwordRef = useRef<TextInput>(null);
+
+  function showToast(msg: string) {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3500);
+  }
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    if (welcomeTimer.current) clearTimeout(welcomeTimer.current);
+  }, []);
+
+  useEffect(() => { warmUpBackend(); }, []);
+
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardDidShow", () => setKbOpen(true));
+    const hide = Keyboard.addListener("keyboardDidHide", () => setKbOpen(false));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  // Header más corto con teclado abierto: deja espacio para el formulario.
+  const heroH = Math.round(SCREEN_H * (kbOpen ? 0.14 : 0.38));
+
+  useEffect(() => {
+    LocalAuthentication.supportedAuthenticationTypesAsync().then((types) => {
+      if (types.includes(LocalAuthentication.AuthenticationType.FACIAL_RECOGNITION)) {
+        setBioType("Face ID");
+      } else if (types.includes(LocalAuthentication.AuthenticationType.FINGERPRINT)) {
+        setBioType("Biométrico");
+      }
+    }).catch(() => { });
+  }, []);
+
+  const canSubmitLogin = username.trim().length > 0 && password.length > 0 && !submitting;
+  const canSubmitReg = regDoc.trim().length > 0 && regMatricula.trim().length > 0 && !submitting;
+  const canSubmitForgot = fpDoc.trim().length > 0 && !fpSending;
+  const hasStrongPassword = rpPass.length >= 8 && /[a-zA-Z]/.test(rpPass) && /\d/.test(rpPass);
+  const canSubmitReset = rpToken.trim().length > 0 && hasStrongPassword && rpPass === rpConfirm && !rpSending && !rpDone;
+
+  async function handleLogin() {
+    Keyboard.dismiss();
+    if (!canSubmitLogin) return;
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      const trimmed = username.trim();
+      const res = await loginRequest({ username: trimmed, password });
+      setTokens(res.access_token, res.csrf_token);
+      try {
+        await SecureStore.setItemAsync(SAVED_CREDENTIALS_KEY, JSON.stringify({ username: trimmed, password }));
+      } catch { /* silent */ }
+      let name = trimmed;
+      let carrera: string | null = null;
+      try {
+        const profile = await fetchPerfil();
+        if (profile.nombre) name = profile.nombre;
+        carrera = profile.carrera_nombre;
+      } catch { /* usa fallback */ }
+      setWelcomeName(name);
+      setWelcomeCarrera(carrera);
+      setLoginSuccess(true);
+      setSubmitting(false);
+      welcomeTimer.current = setTimeout(() => confirmAuth(), 2200);
+    } catch (err) {
+      const axErr = err as AxiosError<{ detail?: string }>;
+      setErrorMsg(axErr.response?.data?.detail ?? "No se pudo iniciar sesión. Verificá los datos.");
+      setSubmitting(false);
+    }
+  }
+
+  async function handleRegister() {
+    Keyboard.dismiss();
+    if (!canSubmitReg) return;
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      const detail = await registroRequest({
+        documento: regDoc.trim(),
+        matricula: regMatricula.trim(),
+        ...(foreignOpen && foreignDocType ? { tipo_documento_extranjero: foreignDocType } : {}),
+        ...(foreignOpen && foreignCountry
+          ? { pais_documento: foreignCountry === "OTRO" && foreignCountryText.trim() ? foreignCountryText.trim() : foreignCountry }
+          : {}),
+      });
+      showToast(detail);
+      setRegDoc("");
+      setRegMatricula("");
+      setForeignOpen(false);
+      setForeignDocType("");
+      setForeignCountry("");
+      setForeignCountryText("");
+      setTab("login");
+    } catch (err) {
+      const axErr = err as AxiosError<{ detail?: string }>;
+      setErrorMsg(axErr.response?.data?.detail ?? "No se pudo enviar la solicitud de registro.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleForgotSend() {
+    if (!canSubmitForgot) return;
+    setFpSending(true);
+    try {
+      const detail = await recuperarContrasenaRequest(fpDoc.trim());
+      showToast(detail);
+    } catch (err) {
+      const axErr = err as AxiosError<{ detail?: string }>;
+      showToast(axErr.response?.data?.detail ?? `Contactá a secretaría: ${SECRETARIA_EMAIL}`);
+    } finally {
+      setFpSending(false);
+      setFpDoc("");
+      setScreen("main");
+    }
+  }
+
+  async function handleResetSend() {
+    Keyboard.dismiss();
+    if (!canSubmitReset) return;
+    setRpSending(true);
+    try {
+      const detail = await resetPasswordRequest({
+        token: rpToken.trim(),
+        new_password: rpPass,
+      });
+      showToast(detail);
+      setRpDone(true);
+    } catch (err) {
+      const axErr = err as AxiosError<{ detail?: string }>;
+      setErrorMsg(axErr.response?.data?.detail ?? "No se pudo restablecer la contraseña. Verificá el token.");
+    } finally {
+      setRpSending(false);
+    }
+  }
+
+  async function handleBiometricPress() {
+    try {
+      const hasHardware = await LocalAuthentication.hasHardwareAsync();
+      const enrolled = await LocalAuthentication.isEnrolledAsync();
+      if (!hasHardware || !enrolled) {
+        showToast("Biometría no configurada en este dispositivo");
+        return;
+      }
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: "Ingresá tus datos biométricos para ingresar al Portal Académico",
+        cancelLabel: "Cancelar",
+        disableDeviceFallback: false,
+      });
+      if (!result.success) {
+        if (result.error !== "user_cancel") showToast("Autenticación fallida");
+        return;
+      }
+      const raw = await SecureStore.getItemAsync(SAVED_CREDENTIALS_KEY);
+      if (!raw) {
+        showToast("Iniciá sesión manualmente una vez para habilitar el acceso biométrico");
+        return;
+      }
+      const creds = JSON.parse(raw) as { username: string; password: string };
+      setSubmitting(true);
+      setErrorMsg(null);
+      try {
+        const res = await loginRequest(creds);
+        setTokens(res.access_token, res.csrf_token);
+        let name = creds.username;
+        let carrera: string | null = null;
+        try {
+          const profile = await fetchPerfil();
+          if (profile.nombre) name = profile.nombre;
+          carrera = profile.carrera_nombre;
+        } catch { /* usa fallback */ }
+        setWelcomeName(name);
+        setWelcomeCarrera(carrera);
+        setLoginSuccess(true);
+        welcomeTimer.current = setTimeout(() => confirmAuth(), 2200);
+      }
+      catch { showToast("No se pudo iniciar sesión con las credenciales guardadas"); }
+      finally { setSubmitting(false); }
+    } catch {
+      showToast("Autenticación fallida");
+    }
+  }
+
+  function handleForeignTogglePress() {
+    setForeignOpen((v) => {
+      const next = !v;
+      if (!next) {
+        // Se está cerrando la sección: limpiar lo que haya quedado elegido.
+        setForeignDocType("");
+        setForeignCountry("");
+        setForeignCountryText("");
+      }
+      return next;
+    });
+  }
+
+  return (
+    <WaveBackground title={TITLE} heroHeight={heroH}>
+      <StatusBar barStyle="dark-content" />
+      <SafeAreaView style={{ flex: 1 }} edges={["bottom"]}>
+        <View style={{ height: heroH }} />
+
+        {screen !== "main" ? (
+          <View style={{ position: "absolute", top: insets.top + spacing.sm, left: spacing.xl, zIndex: 10 }}>
+            <Pressable
+              onPress={() => setScreen("main")}
+              hitSlop={16}
+              style={({ pressed }) => ({
+                flexDirection: "row",
+                alignItems: "center",
+                opacity: pressed ? 0.75 : 1,
+              })}
+            >
+              <View
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: 22,
+                  backgroundColor: "rgba(13,33,55,0.06)",
+                  borderWidth: 1,
+                  borderColor: "rgba(13,33,55,0.14)",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <BackArrowIcon color={P.headerTitle} />
+              </View>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {screen === "main" ? (
+          <>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, paddingTop: 0, paddingBottom: spacing.sm }}>
+              <CapIcon fill={P.accent} size={34} />
+              <Text style={{ fontFamily: fontFamily.interSemibold, fontSize: 13.5, color: P.accent, textAlign: "center" }}>
+                {tab === "login" ? "UCA Caacupé · Bienvenido, estudiante" : "UCA Caacupé · Creá tu cuenta"}
+              </Text>
+            </View>
+
+            <View style={{ paddingHorizontal: spacing.xl }}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  backgroundColor: "rgba(255,255,255,0.06)",
+                  borderWidth: 1,
+                  borderColor: "rgba(255,255,255,0.14)",
+                  borderRadius: 999,
+                  padding: 5,
+                }}
+              >
+                <Pressable
+                  style={{
+                    flex: 1, paddingVertical: 11, alignItems: "center", borderRadius: 999,
+                    backgroundColor: tab === "login" ? P.tabPill : "transparent",
+                  }}
+                  onPress={() => { setTab("login"); setErrorMsg(null); }}
+                >
+                  <Text style={{ fontFamily: fontFamily.interBold, fontSize: 14, color: tab === "login" ? P.white : P.mutedText }}>
+                    Iniciar Sesión
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={{
+                    flex: 1, paddingVertical: 11, alignItems: "center", borderRadius: 999,
+                    backgroundColor: tab === "register" ? P.tabPill : "transparent",
+                  }}
+                  onPress={() => { setTab("register"); setErrorMsg(null); }}
+                >
+                  <Text style={{ fontFamily: fontFamily.interBold, fontSize: 14, color: tab === "register" ? P.white : P.mutedText }}>
+                    Registrarme
+                  </Text>
+                </Pressable>
+              </View>
+            </View>
+
+            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined} keyboardVerticalOffset={Platform.OS === "ios" ? 50 : 0}>
+              <ScrollView
+                style={{ flex: 1 }}
+                contentContainerStyle={{ paddingHorizontal: spacing.xl, paddingTop: spacing.xl, paddingBottom: spacing.lg, gap: spacing.md }}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+                bounces={false}
+              >
+                {tab === "login" ? (
+                  <Animated.View
+                    key="login-form"
+                    entering={FadeIn.duration(200)}
+                    exiting={FadeOut.duration(150)}
+                    style={{ gap: spacing.md }}
+                  >
+                    <LabeledInput
+                      label="Nro. de Documento"
+                      value={username}
+                      onChangeText={setUsername}
+                      placeholder="Nro. de Documento"
+                      keyboardType={foreignOpen ? "default" : "number-pad"}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="next"
+                      onSubmitEditing={() => passwordRef.current?.focus()}
+                    />
+                    <LabeledInput
+                      ref={passwordRef}
+                      label="Contraseña"
+                      value={password}
+                      onChangeText={setPassword}
+                      placeholder="••••••••••"
+                      secureTextEntry={!showPassword}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="go"
+                      onSubmitEditing={handleLogin}
+                      rightAccessory={
+                        <Pressable onPress={() => setShowPassword((v) => !v)} hitSlop={12} style={{ padding: 10 }}>
+                          <EyeIcon open={showPassword} />
+                        </Pressable>
+                      }
+                    />
+
+                    {foreignOpen ? (
+                      <Animated.View entering={FadeIn.duration(200)} exiting={FadeOut.duration(150)} style={{ gap: spacing.md }}>
+                        <SelectField
+                          label="Tipo de documento"
+                          options={DOC_TYPES}
+                          selectedValue={foreignDocType || null}
+                          placeholder="Seleccioná un tipo"
+                          onSelect={(opt) => setForeignDocType(opt.value)}
+                        />
+                        <SelectField
+                          label="País del documento"
+                          options={COUNTRIES}
+                          selectedValue={foreignCountry || null}
+                          placeholder="Seleccioná un país"
+                          onSelect={(opt) => setForeignCountry(opt.value)}
+                        />
+                        {foreignCountry === "OTRO" ? (
+                          <LabeledInput
+                            label="Escribí el país"
+                            value={foreignCountryText}
+                            onChangeText={setForeignCountryText}
+                            placeholder="Nombre del país"
+                            autoCapitalize="words"
+                            autoCorrect={false}
+                          />
+                        ) : null}
+                      </Animated.View>
+                    ) : null}
+
+                    {errorMsg ? <ErrorText msg={errorMsg} /> : null}
+
+                    <GradientButton
+                      label="Ingresar"
+                      disabled={!canSubmitLogin}
+                      loading={submitting}
+                      onPress={handleLogin}
+                      showArrow
+                    />
+                  </Animated.View>
+                ) : (
+                  <Animated.View
+                    key="register-form"
+                    entering={FadeIn.duration(200)}
+                    exiting={FadeOut.duration(150)}
+                    style={{ gap: spacing.md }}
+                  >
+                    <LabeledInput
+                      label="Nro. de Documento"
+                      value={regDoc}
+                      onChangeText={setRegDoc}
+                      placeholder="Nro. de Documento"
+                      keyboardType={foreignOpen ? "default" : "number-pad"}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="next"
+                    />
+                    <LabeledInput
+                      label="Matrícula"
+                      value={regMatricula}
+                      onChangeText={setRegMatricula}
+                      placeholder="Matrícula"
+                      autoCapitalize="characters"
+                      autoCorrect={false}
+                      returnKeyType="go"
+                      onSubmitEditing={handleRegister}
+                    />
+
+                    {foreignOpen ? (
+                      <Animated.View entering={FadeIn.duration(200)} exiting={FadeOut.duration(150)} style={{ gap: spacing.md }}>
+                        <SelectField
+                          label="Tipo de documento"
+                          options={DOC_TYPES}
+                          selectedValue={foreignDocType || null}
+                          placeholder="Seleccioná un tipo"
+                          onSelect={(opt) => setForeignDocType(opt.value)}
+                        />
+                        <SelectField
+                          label="País del documento"
+                          options={COUNTRIES}
+                          selectedValue={foreignCountry || null}
+                          placeholder="Seleccioná un país"
+                          onSelect={(opt) => setForeignCountry(opt.value)}
+                        />
+                        {foreignCountry === "OTRO" ? (
+                          <LabeledInput
+                            label="Escribí el país"
+                            value={foreignCountryText}
+                            onChangeText={setForeignCountryText}
+                            placeholder="Nombre del país"
+                            autoCapitalize="words"
+                            autoCorrect={false}
+                          />
+                        ) : null}
+                      </Animated.View>
+                    ) : null}
+
+                    {errorMsg ? <ErrorText msg={errorMsg} /> : null}
+
+                    <GradientButton
+                      label="Registrarme"
+                      disabled={!canSubmitReg}
+                      loading={submitting}
+                      onPress={handleRegister}
+                    />
+                  </Animated.View>
+                )}
+              </ScrollView>
+              <View style={{ flexDirection: "row", justifyContent: "space-evenly", paddingHorizontal: spacing.xl, paddingTop: spacing.md, paddingBottom: spacing.md }}>
+                <QuickTile
+                  active={foreignOpen}
+                  icon={<GlobeIcon />}
+                  label={"Documento\nextranjero"}
+                  onPress={handleForeignTogglePress}
+                />
+                <QuickTile
+                  icon={<FingerprintIcon />}
+                  label={bioType}
+                  onPress={handleBiometricPress}
+                />
+                <QuickTile
+                  icon={<KeyIcon />}
+                  label={"Olvidé mi\ncontraseña"}
+                  onPress={() => setScreen("forgot")}
+                />
+              </View>
+            </KeyboardAvoidingView>
+          </>
+        ) : screen === "forgot" ? (
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+            <View style={{ flex: 1, justifyContent: "center", paddingHorizontal: spacing.xl, paddingBottom: spacing["3xl"] }}>
+              <Text style={{ color: P.white, fontFamily: fontFamily.interBold, fontSize: 26, textAlign: "center" }}>
+                Recuperar contraseña
+              </Text>
+              <Text style={{ color: P.mutedText, fontFamily: fontFamily.inter, fontSize: 14, lineHeight: 20, textAlign: "center", marginTop: spacing.xs, marginBottom: spacing.xl }}>
+                Ingresá tu documento de identidad o email. Si el usuario existe, recibirás un email con instrucciones y un enlace para restablecer tu contraseña.
+              </Text>
+
+              <View style={{ gap: spacing.md }}>
+                <LabeledInput
+                  value={fpDoc}
+                  onChangeText={setFpDoc}
+                  placeholder="Nro. de Documento o Email"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  returnKeyType="go"
+                  onSubmitEditing={handleForgotSend}
+                />
+                <GradientButton
+                  label="Enviar instrucciones"
+                  disabled={!canSubmitForgot}
+                  loading={fpSending}
+                  onPress={handleForgotSend}
+                />
+              </View>
+
+              <Pressable
+                onPress={() => { setScreen("reset"); setErrorMsg(null); setRpDone(false); }}
+                style={{ marginTop: spacing.lg, alignItems: "center" }}
+              >
+                <Text style={{ color: P.accent, fontFamily: fontFamily.interSemibold, fontSize: 13.5, textDecorationLine: "underline" }}>
+                  Ya tengo el token del email
+                </Text>
+              </Pressable>
+            </View>
+          </KeyboardAvoidingView>
+        ) : (
+          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+            <View style={{ flex: 1, justifyContent: "center", paddingHorizontal: spacing.xl, paddingBottom: spacing["3xl"] }}>
+              {rpDone ? (
+                <Animated.View entering={FadeIn.duration(250)} style={{ alignItems: "center", gap: spacing.md }}>
+                  <View style={{
+                    width: 84, height: 84, borderRadius: 42,
+                    backgroundColor: "rgba(52,211,153,0.12)", borderWidth: 2, borderColor: "rgba(52,211,153,0.35)",
+                    alignItems: "center", justifyContent: "center",
+                  }}>
+                    <CheckIcon />
+                  </View>
+                  <Text style={{ color: P.white, fontFamily: fontFamily.interBold, fontSize: 22, textAlign: "center" }}>
+                    Contraseña actualizada
+                  </Text>
+                  <Text style={{ color: P.mutedText, fontFamily: fontFamily.inter, fontSize: 14, lineHeight: 20, textAlign: "center" }}>
+                    Ya podés iniciar sesión con tu nueva contraseña.
+                  </Text>
+                  <GradientButton
+                    label="Volver al ingreso"
+                    disabled={false}
+                    loading={false}
+                    onPress={() => { setScreen("main"); setRpDone(false); setRpToken(""); setRpPass(""); setRpConfirm(""); setErrorMsg(null); }}
+                    showArrow
+                  />
+                </Animated.View>
+              ) : (
+                <Animated.View entering={FadeIn.duration(250)}>
+                  <Text style={{ color: P.white, fontFamily: fontFamily.interBold, fontSize: 26, textAlign: "center" }}>
+                    Restablecer contraseña
+                  </Text>
+                  <Text style={{ color: P.mutedText, fontFamily: fontFamily.inter, fontSize: 14, lineHeight: 20, textAlign: "center", marginTop: spacing.xs, marginBottom: spacing.xl }}>
+                    Ingresá el token del email que recibiste y definí tu nueva contraseña (mínimo 8 caracteres con letras y números).
+                  </Text>
+
+                  <View style={{ gap: spacing.md }}>
+                    <LabeledInput
+                      value={rpToken}
+                      onChangeText={setRpToken}
+                      placeholder="Token del email"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="next"
+                      onSubmitEditing={() => rpPassRef.current?.focus()}
+                    />
+                    <LabeledInput
+                      ref={rpPassRef}
+                      value={rpPass}
+                      onChangeText={setRpPass}
+                      placeholder="Nueva contraseña"
+                      secureTextEntry
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="next"
+                      onSubmitEditing={() => rpConfirmRef.current?.focus()}
+                    />
+                    <LabeledInput
+                      ref={rpConfirmRef}
+                      value={rpConfirm}
+                      onChangeText={setRpConfirm}
+                      placeholder="Repetí la contraseña"
+                      secureTextEntry
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      returnKeyType="go"
+                      onSubmitEditing={handleResetSend}
+                    />
+
+                    {!rpPass || rpPass === rpConfirm ? null : (
+                      <Text style={{ color: P.error, fontFamily: fontFamily.inter, fontSize: 12.5, textAlign: "center" }}>
+                        Las contraseñas no coinciden.
+                      </Text>
+                    )}
+                    {rpPass.length >= 8 || !rpPass ? null : (
+                      <Text style={{ color: P.error, fontFamily: fontFamily.inter, fontSize: 12.5, textAlign: "center" }}>
+                        La contraseña debe tener al menos 8 caracteres.
+                      </Text>
+                    )}
+                    {rpPass.length >= 8 && (!/[a-zA-Z]/.test(rpPass) || !/\d/.test(rpPass)) ? (
+                      <Text style={{ color: P.error, fontFamily: fontFamily.inter, fontSize: 12.5, textAlign: "center" }}>
+                        Debe incluir letras y números.
+                      </Text>
+                    ) : null}
+                    {errorMsg ? <ErrorText msg={errorMsg} /> : null}
+
+                    <GradientButton
+                      label="Restablecer"
+                      disabled={!canSubmitReset}
+                      loading={rpSending}
+                      onPress={handleResetSend}
+                    />
+                  </View>
+                </Animated.View>
+              )}
+            </View>
+          </KeyboardAvoidingView>
+        )}
+      </SafeAreaView>
+
+      {toast ? (
+        <Animated.View
+          entering={FadeIn.duration(350).easing(Easing.out(Easing.cubic))}
+          exiting={FadeOut.duration(250)}
+          style={{
+            position: "absolute",
+            left: spacing.xl,
+            right: spacing.xl,
+            bottom: spacing["3xl"],
+            backgroundColor: "#123a52",
+            borderWidth: 1,
+            borderColor: "rgba(56,189,248,0.4)",
+            borderRadius: 16,
+            padding: spacing.md,
+            flexDirection: "row",
+            alignItems: "center",
+            gap: spacing.sm,
+          }}
+        >
+          <CheckIcon />
+          <Text style={{ color: "#dff2fc", fontFamily: fontFamily.interSemibold, fontSize: 13.5, flex: 1 }}>
+            {toast}
+          </Text>
+        </Animated.View>
+      ) : null}
+
+      {loginSuccess ? <WelcomeOverlay name={welcomeName} carrera={welcomeCarrera} /> : null}
+    </WaveBackground>
+  );
+}
+
+const welcomeOverlayStyles = StyleSheet.create({
+  overlay: {
+    position: "absolute",
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: P.navy,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 16,
+    zIndex: 999,
+  },
+  iconCircle: {
+    width: 104,
+    height: 104,
+    borderRadius: 52,
+    backgroundColor: "rgba(56,189,248,0.08)",
+    borderWidth: 2,
+    borderColor: "rgba(56,189,248,0.25)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+});
+
+function WelcomeOverlay({ name, carrera }: { name: string; carrera: string | null }) {
+  return (
+    <Animated.View
+      entering={FadeIn.duration(300)}
+      style={welcomeOverlayStyles.overlay}
+    >
+      <Animated.View entering={ZoomIn.duration(500).springify().damping(15)}>
+        <View style={welcomeOverlayStyles.iconCircle}>
+          <CapIcon fill={P.accent} size={48} />
+        </View>
+      </Animated.View>
+
+      <View style={{ height: 8 }} />
+
+      <Animated.View entering={FadeIn.duration(400).delay(300)}>
+        <Text style={{
+          color: P.accent,
+          fontFamily: fontFamily.interSemibold,
+          fontSize: 13,
+          letterSpacing: 2,
+        }}>
+          BIENVENIDO
+        </Text>
+      </Animated.View>
+
+      <Animated.View entering={FadeIn.duration(500).delay(500)}>
+        <Text style={{
+          color: P.white,
+          fontFamily: fontFamily.interBold,
+          fontSize: 28,
+          textAlign: "center",
+          paddingHorizontal: 40,
+          lineHeight: 34,
+        }}>
+          {name}
+        </Text>
+      </Animated.View>
+
+      {carrera ? (
+        <Animated.View entering={FadeIn.duration(400).delay(700)}>
+          <Text style={{
+            color: P.mutedText,
+            fontFamily: fontFamily.inter,
+            fontSize: 15,
+            textAlign: "center",
+            paddingHorizontal: 40,
+          }}>
+            {carrera}
+          </Text>
+        </Animated.View>
+      ) : null}
+
+      <View style={{ position: "absolute", bottom: 80, flexDirection: "row", gap: 10 }}>
+        <EnteringDot delay={0} />
+        <EnteringDot delay={200} />
+        <EnteringDot delay={400} />
+      </View>
+    </Animated.View>
+  );
+}
+
+function EnteringDot({ delay }: { delay: number }) {
+  return (
+    <Animated.View
+      entering={FadeIn.duration(300).delay(delay + 900)}
+      style={{
+        width: 8,
+        height: 8,
+        borderRadius: 4,
+        backgroundColor: P.accent,
+      }}
+    />
+  );
+}
+
+function ErrorText({ msg }: { msg: string }) {
+  return (
+    <Text style={{ color: P.error, fontFamily: fontFamily.inter, fontSize: 13, textAlign: "center" }}>
+      {msg}
+    </Text>
+  );
+}
+
+const LabeledInput = React.forwardRef<TextInput, {
+  label?: string;
+  rightAccessory?: React.ReactNode;
+  accent?: boolean;
+} & React.ComponentProps<typeof TextInput>>(function LabeledInput({
+  label,
+  rightAccessory,
+  accent,
+  ...inputProps
+}, ref) {
+  const [focused, setFocused] = useState(false);
+  const borderColor = focused || accent ? P.inputBorderAccent : P.inputBorder;
+  return (
+    <View style={{ gap: 6 }}>
+      {label ? (
+        <Text style={{ fontFamily: fontFamily.interBold, fontSize: 11.5, color: P.inputLabel, textAlign: "center", letterSpacing: 0.4 }}>
+          {label}
+        </Text>
+      ) : null}
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          backgroundColor: P.inputBg,
+          borderWidth: 1.5,
+          borderColor,
+          borderRadius: 999,
+          paddingHorizontal: spacing.lg,
+        }}
+      >
+        <TextInput
+          ref={ref}
+          placeholderTextColor={P.placeholder}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          style={{
+            flex: 1,
+            color: P.white,
+            fontFamily: fontFamily.interSemibold,
+            fontSize: 15,
+            paddingVertical: 16,
+            paddingHorizontal: 10,
+            textAlign: "left",
+          }}
+          selectionColor={P.accent}
+          cursorColor={P.accent}
+          {...inputProps}
+        />
+        {rightAccessory}
+      </View>
+    </View>
+  );
+});
+
+// Selector tipo LabeledInput: mismo pill (borderRadius 999), misma label
+// centrada arriba, mismo borde. El borde acentúa cuando hay valor elegido
+// (equivalente al estado "focused" del input). Texto + chevron a la derecha.
+function GradientButton({
+  label,
+  disabled,
+  loading,
+  onPress,
+  showArrow,
+}: {
+  label: string;
+  disabled: boolean;
+  loading: boolean;
+  onPress: () => void;
+  showArrow?: boolean;
+}) {
+  return (
+    <Pressable onPress={onPress} disabled={disabled} style={({ pressed }) => ({ opacity: disabled ? 0.5 : pressed ? 0.9 : 1, marginTop: spacing.xs })}>
+      <LinearGradient
+        colors={disabled ? ["#2a3744", "#232f3a"] : [P.gradA, P.gradB]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={{
+          borderRadius: 999,
+          paddingVertical: 17,
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          shadowColor: P.accentMid,
+          shadowOffset: { width: 0, height: 10 },
+          shadowRadius: 20,
+          shadowOpacity: disabled ? 0 : 0.45,
+          elevation: disabled ? 0 : 6,
+        }}
+      >
+        {loading
+          ? <ActivityIndicator color={P.white} />
+          : (
+            <>
+              {showArrow ? <ArrowRightIcon /> : null}
+              <Text style={{ color: P.white, fontFamily: fontFamily.interBold, fontSize: 15.5 }}>{label}</Text>
+            </>
+          )
+        }
+      </LinearGradient>
+    </Pressable>
+  );
+}
+
+function QuickTile({
+  icon,
+  label,
+  onPress,
+  active,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onPress?: () => void;
+  active?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({ alignItems: "center", gap: spacing.sm, opacity: pressed ? 0.75 : 1 })}
+      hitSlop={6}
+    >
+      <View style={{
+        width: 72, height: 72, borderRadius: 22,
+        backgroundColor: P.tileBg,
+        borderWidth: 1,
+        borderColor: active ? P.accent : P.tileBorder,
+        alignItems: "center",
+        justifyContent: "center",
+      }}>
+        {icon}
+      </View>
+      <Text style={{ color: P.tileLabel, fontFamily: fontFamily.interSemibold, fontSize: 12.5, textAlign: "center", lineHeight: 16 }}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+function EyeIcon({ open }: { open: boolean }) {
+  if (open) {
+    return (
+      <Svg width={20} height={20} viewBox="0 0 24 24" fill="none">
+        <Path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" stroke={P.inputLabel} strokeWidth={2} />
+        <Path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke={P.inputLabel} strokeWidth={2} />
+      </Svg>
+    );
+  }
+  return (
+    <Svg width={20} height={20} viewBox="0 0 24 24" fill="none">
+      <Path d="M3 3l18 18" stroke={P.inputLabel} strokeWidth={2} strokeLinecap="round" />
+      <Path d="M10.6 5.2A10.9 10.9 0 0112 5c6.5 0 10 7 10 7a15.6 15.6 0 01-3.4 4.3M6.5 6.6C4 8.3 2 12 2 12a15.9 15.9 0 004.2 4.8A10.6 10.6 0 0012 19c1 0 1.9-.1 2.8-.4" stroke={P.inputLabel} strokeWidth={2} strokeLinecap="round" />
+      <Path d="M9.9 10a3 3 0 004.2 4.2" stroke={P.inputLabel} strokeWidth={2} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function GlobeIcon() {
+  return (
+    <Svg width={30} height={30} viewBox="0 0 24 24" fill="none">
+      <Path d="M5 3h14a2 2 0 012 2v18a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2z" stroke={P.tileIcon} strokeWidth={1.9} />
+      <Path d="M9 8h6M9 12h6M9 16h3" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function FingerprintIcon() {
+  return (
+    <Svg width={30} height={30} viewBox="0 0 24 24" fill="none">
+      <Path d="M12 11a3 3 0 013 3c0 2.5-.5 4.5-1.2 6.2" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+      <Path d="M9.2 20.5c.9-1.8 1.3-4 1.3-6.5a1.5 1.5 0 013 0" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+      <Path d="M6.5 18.2C7.5 16.3 8 14.3 8 12a4 4 0 017-2.6" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+      <Path d="M4.6 15A9 9 0 014 12a8 8 0 0112.6-6.5" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+      <Path d="M19.5 9.5c.3.8.5 1.6.5 2.5 0 1.2-.1 2.3-.3 3.4" stroke={P.tileIcon} strokeWidth={1.9} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function KeyIcon() {
+  return (
+    <Svg width={30} height={30} viewBox="0 0 24 24" fill={P.tileIcon} stroke="none">
+      <Path d="M8 16.5a4.5 4.5 0 100-9 4.5 4.5 0 000 9z" />
+      <Path d="M11 11.6h10v2.8H11z" />
+      <Path d="M16.5 12v4h2.6v-4z" />
+    </Svg>
+  );
+}
+
+function ArrowRightIcon() {
+  return (
+    <Svg width={17} height={17} viewBox="0 0 24 24" fill="none">
+      <Path d="M10 17l5-5-5-5" stroke={P.white} strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round" />
+      <Path d="M15 12H3" stroke={P.white} strokeWidth={2.2} strokeLinecap="round" />
+    </Svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <Svg width={20} height={20} viewBox="0 0 24 24" fill="none">
+      <Path d="M5 13l4 4 10-10" stroke={P.accent} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
