@@ -1,6 +1,6 @@
 <div align="center">
 
-# Sistema Académico UCA V2
+# Sistema Académico
 
 Plataforma de gestión académica para la Universidad Católica «Nuestra Señora de la Asunción», Unidad Pedagógica de Caacupé. Tiene backend en **FastAPI**, frontend web en **React** y una app móvil en **Expo**, con portales para los roles **Alumno**, **Profesor** y **Administrador**.
 
@@ -99,6 +99,32 @@ Las capturas se tomaron en local con datos ficticios generados por los scripts d
 | <img src="docs/screenshots/admin-dashboard.webp" alt="Panel del administrador con módulos del sistema"> | <img src="docs/screenshots/admin-usuarios.webp" alt="Listado de usuarios con filtros por rol"> |
 
 Hay más capturas en [`docs/screenshots/`](docs/screenshots): mis materias del profesor y el panel financiero.
+
+## <img src="docs/icons/movil.svg" width="22" align="top" alt=""> App móvil
+
+App **UCA Móvil** hecha con Expo SDK 57 y expo-router, pensada para el alumno. Consume la misma API que la web.
+
+| Pantalla | Qué hace |
+|---|---|
+| Login | Inicio de sesión con documento o documento extranjero, registro, recuperación de contraseña y acceso con biometría (`expo-local-authentication`) |
+| Inicio | Resumen académico del alumno |
+| Cursos | Materias inscriptas con el detalle de cada una |
+| Horario | Próximos eventos del calendario académico |
+| Escáner QR | Registro de asistencia con la cámara (`expo-camera`) |
+| Exámenes | Exámenes disponibles e inscripciones |
+| Cuenta | Estado de cuenta y cuotas |
+| Perfil | Datos del alumno, cambio de contraseña y tema claro u oscuro |
+
+- **Sesión:** los tokens se guardan en `expo-secure-store`. El cliente HTTP reintenta con el refresh token y reenvía el header CSRF, igual que la web.
+- **Backend:** la URL se toma de `EXPO_PUBLIC_API_BASE` y, si no está, de `extra.apiBase` en `app.json`. Los perfiles `preview` y `production` de `eas.json` apuntan al backend de Render.
+- **Calidad:** el typecheck (`tsc`) pasa sin errores y hay 10 de 10 tests con Jest y Testing Library (login, dashboard y escáner).
+
+```powershell
+cd mobile
+npm install
+npx expo start          # Expo Go o dev client
+npm test                # tests
+```
 
 ## <img src="docs/icons/arquitectura.svg" width="22" align="top" alt=""> Arquitectura
 
