@@ -1,5 +1,5 @@
 // Alumno. Pantalla de escaneo de QR para registrar presente. Depende de: POST /asistencias/qr/verificar.
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import jsQR from 'jsqr'
 import { api, getCurrentUser } from '../lib/api'
@@ -65,14 +65,13 @@ export default function AsistenciaScan() {
 
   const [cargandoMat, setCargandoMat] = useState(false)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
-  const cargarMaterias = () => {
-    setCargandoMat(true)
+  const pedirMaterias = useCallback(() =>
     api.get<MateriaAsist[]>('/alumno/mi-asistencia')
       .then(d => { setMaterias(d); setLastUpdate(new Date()) })
       .catch(() => {})
-      .finally(() => setCargandoMat(false))
-  }
-  useEffect(() => { cargarMaterias() }, [])
+      .finally(() => setCargandoMat(false)), [])
+  const cargarMaterias = () => { setCargandoMat(true); pedirMaterias() }
+  useEffect(() => { pedirMaterias() }, [pedirMaterias])
 
   useEffect(() => {
     if (!token) return

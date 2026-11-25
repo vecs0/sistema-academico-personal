@@ -3,7 +3,9 @@ fastapi
 uvicorn[standard]
 
 # Base de datos y ORM
-sqlalchemy
+# SQLAlchemy 2.1 cambió el driver por defecto de postgresql:// a psycopg 3; acá se
+# usa psycopg2, así que sin este tope falla "alembic upgrade head" (CI y Render).
+sqlalchemy>=2.0,<2.1
 alembic
 psycopg2-binary
 

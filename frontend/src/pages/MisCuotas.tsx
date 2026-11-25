@@ -107,14 +107,16 @@ export default function MisCuotas() {
     .sort((x, y) => x.fecha_vencimiento.localeCompare(y.fecha_vencimiento))
   const proxima = abiertas.find(c => c.estado === 'vencida') ?? abiertas[0] ?? null
   const primeraVencida = abiertas.find(c => c.estado === 'vencida') ?? null
-  const diasDesde = (f: string) => Math.max(0, Math.floor((Date.now() - new Date(f).getTime()) / 86400000))
+  // Se mide contra la última carga (estado), no contra Date.now(): el render debe ser puro.
+  const ahora = lastUpdate?.getTime() ?? 0
+  const diasDesde = (f: string) => Math.max(0, Math.floor((ahora - new Date(f).getTime()) / 86400000))
 
   async function pagar(cuota: Cuota) {
     setPagandoId(cuota.id)
     try {
       const returnUrl = `${window.location.origin}/mis-cuotas`
       const res = await initPagoOnline(cuota.id, `${returnUrl}?stripe=success`, `${returnUrl}?stripe=cancel`)
-      window.location.href = res.redirect_url
+      window.location.assign(res.redirect_url)
     } catch {
       emitToast('Error al iniciar pago', 'error')
     } finally {
